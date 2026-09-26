@@ -20,7 +20,7 @@ import requests
 # ============================================================
 
 st.set_page_config(
-    page_title="Z UI Studio",
+    page_title="ZAKO AI Studio",
     page_icon="🎧",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -28,8 +28,8 @@ st.set_page_config(
 
 # -------------------- INTERNAL CONFIG (never shown to normal users) --------------------
 
-REPO_OWNER = "mfazil78761-glitch"
-REPO_NAME = "F5-TTS-AK"
+REPO_OWNER = "salmanali35435-dev"
+REPO_NAME = "F5-TTS-Khan"
 DB_URL = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/users_db.json"
 GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/users_db.json"
 GITHUB_PAT_TOKEN = str(st.secrets.get("GITHUB_PAT_TOKEN", "")).strip()
@@ -845,7 +845,7 @@ def render_login():
     st.markdown(
         """
         <div class="zui-header" style="text-align:center;">
-            <div class="zui-brand" style="font-size:2rem;">Z UI Studio</div>
+            <div class="zui-brand" style="font-size:2rem;">ZAKO AI Studio</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -925,7 +925,7 @@ def render_login():
                 <div style="font-weight:700;margin-bottom:6px;">Need access?</div>
                 <div class="small-muted">{ADMIN_CONTACT_NAME} · {WHATSAPP_DISPLAY}</div>
                 <a href="https://wa.me/{WHATSAPP_NUMBER_INTL}?text={requests.utils.quote(
-                    f'Hi {ADMIN_CONTACT_NAME}, I want to request access to Z UI Studio.'
+                    f'Hi {ADMIN_CONTACT_NAME}, I want to request access to ZAKO AI Studio.'
                 )}" target="_blank">
                     <button style="margin-top:10px;padding:10px 18px;border-radius:10px;
                         border:1px solid rgba(94,231,255,.35);background:rgba(94,231,255,.08);
@@ -980,7 +980,7 @@ def do_logout():
 # -------------------- NAVIGATION (sidebar doubles as hamburger drawer on mobile) --------------------
 
 with st.sidebar:
-    st.markdown('<div class="zui-brand" style="font-size:1.3rem;">☰ Z UI Studio</div>', unsafe_allow_html=True)
+    st.markdown('<div class="zui-brand" style="font-size:1.3rem;">☰ ZAKO AI Studio</div>', unsafe_allow_html=True)
     st.caption(active_username.title())
     st.divider()
 
@@ -999,7 +999,7 @@ with st.sidebar:
 
 
 def render_footer():
-    msg = requests.utils.quote("Hi, I want to know more about Z UI Studio.")
+    msg = requests.utils.quote("Hi, I want to know more about ZAKO AI Studio.")
     st.markdown(
         f"""
         <div class="zui-footer">
@@ -1117,7 +1117,7 @@ def page_voice_cloning():
     st.caption("Upload a short reference sample and save it under a name you'll recognize.")
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    voice_name = st.text_input("Voice Name", placeholder="e.g. Guru Ji", max_chars=80, key="voice_name_input")
+    voice_name = st.text_input("Voice Name", placeholder="e.g. NMAE", max_chars=80, key="voice_name_input")
     uploaded_voice = st.file_uploader(
         "Upload Reference Voice",
         type=["wav", "mp3", "m4a", "ogg", "flac"],
