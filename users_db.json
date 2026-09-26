@@ -1,0 +1,32 @@
+{
+  "users": {
+    "AKKHAN": {
+      "password": "AKKHAN90",
+      "expiry_timestamp": "2030-12-31 23:59:59",
+      "total_limit": 99999999,
+      "remaining_chars": 99999999,
+      "is_revoked": false,
+      "is_admin": true
+    },
+    "USAMA": {
+      "password": "Usama@3298",
+      "expiry_timestamp": "2026-10-29 11:52:05",
+      "total_limit": 10000,
+      "remaining_chars": 1000000,
+      "is_revoked": false,
+      "is_admin": false,
+      "kaggle_username": "mfazil761",
+      "kaggle_token": "KGAT_92e513d377956ae5b79234d5470fc971"
+    },
+    "RAZA": {
+      "password": "Raza123",
+      "expiry_timestamp": "2026-09-27 12:40:21",
+      "total_limit": 1000,
+      "remaining_chars": 96192,
+      "is_revoked": false,
+      "is_admin": false,
+      "kaggle_username": "pknetwork",
+      "kaggle_token": "KGAT_8d3b2de80c15b58f127de16bb773f985"
+    }
+  }
+}
