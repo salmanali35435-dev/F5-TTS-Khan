@@ -1,0 +1,4 @@
+streamlit
+kaggle
+pyngrok
+requests
