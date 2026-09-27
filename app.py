@@ -582,7 +582,7 @@ try:
     from f5_tts.api import F5TTS
     tts = F5TTS(model="F5TTS_v1_Base", device="cuda")
     write_status("ready", "Server ready")
-    log("Server ready. Waiting for jobs...")
+    print("Server ready. Waiting for jobs...", flush=True)
     processed = set()
     started = time.time()
     while True:
