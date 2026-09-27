@@ -11,23 +11,26 @@ import shutil
 import time
 import re
 import select
+import html
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 import requests
 
 # ============================================================
-# Z UI STUDIO
+# ZAIKO AI STUDIO
 # ============================================================
 
 st.set_page_config(
-    page_title="ZAKO AI Studio",
-    page_icon="🎧",
+    page_title="ZAIKO AI STUDIO",
+    page_icon="🎙️",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-# -------------------- INTERNAL CONFIG (never shown to normal users) --------------------
-
+# -------------------- INTERNAL CONFIG --------------------
+# Backend/provider names are intentionally not exposed in the normal UI.
 REPO_OWNER = "salmanali35435-dev"
 REPO_NAME = "F5-TTS-Khan"
 DB_URL = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/users_db.json"
@@ -36,37 +39,34 @@ GITHUB_PAT_TOKEN = str(st.secrets.get("GITHUB_PAT_TOKEN", "")).strip()
 
 DATA_ROOT = Path("cloud_vault")
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
-
 SESSIONS_FILE = DATA_ROOT / "_sessions.json"
+SHARES_FILE = DATA_ROOT / "_shares.json"
 _FILE_LOCKS = {}
 _FILE_LOCKS_GUARD = threading.Lock()
 
 WHATSAPP_NUMBER_INTL = "923097647772"
-WHATSAPP_DISPLAY = "0309 764 7772"
 ADMIN_CONTACT_NAME = "Muhammad Zukriya"
+BRAND = "ZAIKO AI STUDIO"
+FOOTER_BY = "Built By M Zakriya"
+HISTORY_RETENTION_DAYS = 7
+SUPPORTED_VOICE_EXT = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
+MAX_VOICE_SECONDS = 12.0
 
-VALID_PAGES_CLIENT = [
-    "Dashboard", "Voice Cloning", "Text To Speech", "History", "Settings", "Account",
-]
-VALID_PAGES_ADMIN = [
-    "Dashboard", "Active Users Registry", "Deploy New Client", "Settings",
-]
-
+CLIENT_PAGES = ["Dashboard", "Voice Cloning", "Text To Speech", "History", "Settings", "Account"]
+ADMIN_PAGES = ["Dashboard", "Active Users Registry", "Deploy New Client", "Settings"]
 PAGE_ICONS = {
-    "Dashboard": "🏠", "Voice Cloning": "🎙️", "Text To Speech": "🔊",
-    "History": "🕘", "Settings": "⚙️", "Account": "👤",
-    "Active Users Registry": "👑", "Deploy New Client": "➕",
+    "Dashboard": "⌂", "Voice Cloning": "◉", "Text To Speech": "♫",
+    "History": "◷", "Settings": "⚙", "Account": "◎",
+    "Active Users Registry": "♛", "Deploy New Client": "+",
 }
 
-HISTORY_RETENTION_DAYS = 7
+# -------------------- FILE HELPERS --------------------
 
-# -------------------- FILE-BASED PERSISTENCE HELPERS --------------------
-
-def _lock_for(path: Path) -> threading.Lock:
+def _lock_for(path: Path):
     key = str(path)
     with _FILE_LOCKS_GUARD:
         if key not in _FILE_LOCKS:
-            _FILE_LOCKS[key] = threading.Lock()
+            _FILE_LOCKS[key] = threading.RLock()
         return _FILE_LOCKS[key]
 
 
@@ -76,7 +76,9 @@ def load_json(path: Path, default):
         if not path.exists():
             return json.loads(json.dumps(default))
         try:
-            return json.loads(path.read_text(encoding="utf-8") or "null") or json.loads(json.dumps(default))
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw) if raw else None
+            return data if data is not None else json.loads(json.dumps(default))
         except Exception:
             return json.loads(json.dumps(default))
 
@@ -90,37 +92,31 @@ def save_json(path: Path, data):
         tmp.replace(path)
 
 
-def user_dir(username: str) -> Path:
+def user_dir(username):
     p = DATA_ROOT / username
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
-def voice_dir(username: str) -> Path:
+def voice_dir(username):
     p = user_dir(username) / "voices"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
-def jobs_file(username: str) -> Path:
+def jobs_file(username):
     return user_dir(username) / "jobs.json"
 
 
-def active_job_file(username: str) -> Path:
-    return user_dir(username) / "active_job.json"
-
-
-def history_file(username: str) -> Path:
+def history_file(username):
     return user_dir(username) / "history.json"
 
 
-def outputs_dir(username: str) -> Path:
+def outputs_dir(username):
     p = user_dir(username) / "outputs"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
-
-# -------------------- GITHUB "DATABASE" (of user accounts) --------------------
 
 def fallback_database():
     return {
@@ -128,6 +124,7 @@ def fallback_database():
             "password": "AKKHAN90",
             "expiry_timestamp": "2030-12-31 23:59:59",
             "total_limit": 99999999,
+            "total_credits_allocated": 99999999,
             "remaining_chars": 99999999,
             "is_revoked": False,
             "is_admin": True,
@@ -139,259 +136,182 @@ def fallback_database():
 
 def fetch_live_database():
     try:
-        res = requests.get(DB_URL, timeout=15)
-        if res.status_code == 200:
-            users = res.json().get("users", {})
+        r = requests.get(DB_URL, timeout=15)
+        if r.status_code == 200:
+            users = r.json().get("users", {})
             if users:
+                for info in users.values():
+                    info.setdefault("total_credits_allocated", int(info.get("total_limit", 0)))
                 return users
     except Exception:
         pass
     return fallback_database()
 
 
-def push_database_updates(updated_db_dict):
+def push_database_updates(updated_db):
     if not GITHUB_PAT_TOKEN:
-        st.error("Account storage is not configured. Please contact support.")
         return False
-
     headers = {
         "Authorization": f"Bearer {GITHUB_PAT_TOKEN}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "Z-UI-Studio",
+        "User-Agent": "ZAIKO-AI-STUDIO",
     }
     try:
-        get_res = requests.get(GITHUB_API_URL, headers=headers, timeout=15)
-        if get_res.status_code != 200:
-            st.error("We couldn't update your account right now. Please try again shortly.")
+        r = requests.get(GITHUB_API_URL, headers=headers, timeout=15)
+        if r.status_code != 200:
             return False
-        sha = get_res.json().get("sha")
-        content = json.dumps({"users": updated_db_dict}, indent=2, ensure_ascii=False).encode("utf-8")
         payload = {
-            "message": "Update accounts",
-            "content": base64.b64encode(content).decode("ascii"),
-            "sha": sha,
+            "message": "Update ZAIKO AI STUDIO accounts",
+            "content": base64.b64encode(json.dumps({"users": updated_db}, indent=2, ensure_ascii=False).encode()).decode("ascii"),
+            "sha": r.json().get("sha"),
         }
-        put_res = requests.put(GITHUB_API_URL, headers=headers, json=payload, timeout=15)
-        if put_res.status_code in (200, 201):
-            return True
-        st.error("We couldn't update your account right now. Please try again shortly.")
-        return False
+        out = requests.put(GITHUB_API_URL, headers=headers, json=payload, timeout=15)
+        return out.status_code in (200, 201)
     except Exception:
-        st.error("We couldn't update your account right now. Please try again shortly.")
         return False
 
+# -------------------- SESSION SECURITY --------------------
 
-# -------------------- SESSIONS (cookie-based, no credentials in URL) --------------------
-
-def _load_sessions():
+def load_sessions():
     return load_json(SESSIONS_FILE, {})
 
 
-def _save_sessions(sessions):
-    save_json(SESSIONS_FILE, sessions)
+def save_sessions(data):
+    save_json(SESSIONS_FILE, data)
 
 
-def create_session(username: str) -> str:
-    sessions = _load_sessions()
+def request_device_info():
+    try:
+        headers = st.context.headers
+        ua = headers.get("User-Agent", "Unknown browser")
+        ip = headers.get("X-Forwarded-For", headers.get("X-Real-IP", "Unavailable"))
+        if "," in ip:
+            ip = ip.split(",")[0].strip()
+        return {"user_agent": ua, "ip": ip}
+    except Exception:
+        return {"user_agent": "Unknown browser", "ip": "Unavailable"}
+
+
+def create_session(username):
+    sessions = load_sessions()
     sid = uuid.uuid4().hex
     now = datetime.now().isoformat()
+    device = request_device_info()
     sessions[sid] = {
         "username": username,
         "created": now,
         "last_seen": now,
+        "user_agent": device.get("user_agent", "Unknown browser"),
+        "ip": device.get("ip", "Unavailable"),
     }
-    _save_sessions(sessions)
+    save_sessions(sessions)
     return sid
 
 
-def touch_session(sid: str):
-    sessions = _load_sessions()
+def touch_session(sid):
+    sessions = load_sessions()
     if sid in sessions:
         sessions[sid]["last_seen"] = datetime.now().isoformat()
-        _save_sessions(sessions)
+        save_sessions(sessions)
 
 
-def resolve_session(sid: str):
-    if not sid:
-        return None
-    sessions = _load_sessions()
+def resolve_session(sid):
+    sessions = load_sessions()
     entry = sessions.get(sid)
-    if not entry:
-        return None
-    return entry.get("username")
+    return entry.get("username") if entry else None
 
 
-def remove_session(sid: str):
-    sessions = _load_sessions()
+def remove_session(sid):
+    if not sid:
+        return
+    sessions = load_sessions()
     if sid in sessions:
         del sessions[sid]
-        _save_sessions(sessions)
+        save_sessions(sessions)
 
 
-def list_sessions_for_user(username: str):
-    sessions = _load_sessions()
-    return [
-        {"sid": sid, **info}
-        for sid, info in sessions.items()
-        if info.get("username") == username
-    ]
+def sessions_for_user(username):
+    return [{"sid": sid, **data} for sid, data in load_sessions().items() if data.get("username") == username]
 
 
-def set_session_cookie(sid: str, max_age_days: int = 30):
-    max_age = max_age_days * 24 * 60 * 60
+def set_cookie(sid, max_age_days=30):
+    max_age = max_age_days * 86400
     components.html(
-        f"""
-        <script>
-        document.cookie = "zui_session={sid}; path=/; max-age={max_age}; samesite=Lax";
-        setTimeout(function() {{ window.location.reload(); }}, 150);
-        </script>
-        """,
+        f'''<script>
+        document.cookie = "zaiko_session={sid}; path=/; max-age={max_age}; samesite=Lax";
+        setTimeout(function(){{window.parent.location.reload();}},150);
+        </script>''',
         height=0,
     )
 
 
-def clear_session_cookie():
+def clear_cookie():
     components.html(
-        """
-        <script>
-        document.cookie = "zui_session=; path=/; max-age=0";
-        setTimeout(function() { window.location.reload(); }, 150);
-        </script>
-        """,
+        '''<script>
+        document.cookie="zaiko_session=; path=/; max-age=0; samesite=Lax";
+        setTimeout(function(){window.parent.location.reload();},150);
+        </script>''',
         height=0,
     )
 
 
-def get_cookie_session_id():
+def cookie_session_id():
     try:
-        cookies = st.context.cookies
-        return cookies.get("zui_session")
+        return st.context.cookies.get("zaiko_session")
     except Exception:
         return None
 
-
-# -------------------- GENERATION SETTINGS (labelled "Generation Connection" to clients) --------------------
-
-def save_generation_credentials(user_db, account_profile, gen_username, gen_token):
-    account_profile["kaggle_username"] = gen_username.strip()
-    account_profile["kaggle_token"] = gen_token.strip()
-    return push_database_updates(user_db)
-
-
-def remove_generation_credentials(user_db, account_profile):
-    account_profile["kaggle_username"] = ""
-    account_profile["kaggle_token"] = ""
-    return push_database_updates(user_db)
-
-
-def verify_generation_credentials(gen_username, gen_token):
-    """Best-effort verification against the underlying provider."""
-    username_ok, token_ok = False, False
-    if not gen_username:
-        return False, False, "Enter a username."
-    if not gen_token:
-        return username_ok, False, "Enter an API token."
-    env = os.environ.copy()
-    env["KAGGLE_USERNAME"] = gen_username
-    env["KAGGLE_API_TOKEN"] = gen_token
-    env["KAGGLE_KEY"] = gen_token
-    try:
-        result = subprocess.run(
-            ["kaggle", "kernels", "list", "--mine"],
-            env=env, capture_output=True, text=True, timeout=30, check=False,
-        )
-        combined = ((result.stdout or "") + (result.stderr or "")).lower()
-        if result.returncode == 0:
-            username_ok = True
-            token_ok = True
-        elif "401" in combined or "unauthorized" in combined or "invalid" in combined:
-            username_ok = False
-            token_ok = False
-        else:
-            # Ambiguous network/tooling error - don't claim invalid.
-            return False, False, "Could not verify right now. Please try again."
-    except FileNotFoundError:
-        return False, False, "Verification tool is unavailable on this server."
-    except Exception:
-        return False, False, "Could not verify right now. Please try again."
-    return username_ok, token_ok, None
-
-
-# -------------------- JOB STORE (persistent, survives refresh) --------------------
-
-def _job_lock(username):
-    return _lock_for(jobs_file(username))
-
+# -------------------- JOB / HISTORY / SHARE STORES --------------------
 
 def create_job(username, job_type, payload):
-    lock = _job_lock(username)
+    lock = _lock_for(jobs_file(username))
     with lock:
         jobs = load_json(jobs_file(username), {})
-        job_id = uuid.uuid4().hex
+        jid = uuid.uuid4().hex
         now = datetime.now().isoformat()
-        jobs[job_id] = {
-            "job_id": job_id,
-            "type": job_type,
-            "status": "queued",
-            "progress": 0.0,
-            "message": "Queued...",
-            "created": now,
-            "updated": now,
-            "credits_charged": False,
-            "error": None,
-            "result_file": None,
-            **payload,
+        jobs[jid] = {
+            "job_id": jid, "type": job_type, "status": "queued", "progress": 0.0,
+            "message": "Preparing...", "created": now, "updated": now,
+            "credits_charged": False, "history_recorded": False, "error": None,
+            "result_file": None, **payload,
         }
         save_json(jobs_file(username), jobs)
-        save_json(active_job_file(username), {"job_id": job_id, "type": job_type})
-        return job_id
+        return jid
 
 
-def update_job(username, job_id, **fields):
-    lock = _job_lock(username)
+def update_job(username, jid, **fields):
+    lock = _lock_for(jobs_file(username))
     with lock:
         jobs = load_json(jobs_file(username), {})
-        if job_id not in jobs:
+        if jid not in jobs:
             return
-        jobs[job_id].update(fields)
-        jobs[job_id]["updated"] = datetime.now().isoformat()
+        jobs[jid].update(fields)
+        jobs[jid]["updated"] = datetime.now().isoformat()
         save_json(jobs_file(username), jobs)
 
 
-def get_job(username, job_id):
-    jobs = load_json(jobs_file(username), {})
-    return jobs.get(job_id)
+def get_job(username, jid):
+    return load_json(jobs_file(username), {}).get(jid)
 
 
-def get_active_job(username, job_type=None):
-    active = load_json(active_job_file(username), {})
-    job_id = active.get("job_id")
-    if not job_id:
-        return None
-    job = get_job(username, job_id)
-    if not job:
-        return None
-    if job_type and job.get("type") != job_type:
-        return None
-    if job.get("status") in ("completed", "failed", "cancelled"):
-        return None
-    return job
+def all_jobs(username):
+    return list(load_json(jobs_file(username), {}).values())
 
 
-def clear_active_job(username, job_id):
-    active = load_json(active_job_file(username), {})
-    if active.get("job_id") == job_id:
-        save_json(active_job_file(username), {})
+def active_job(username, job_type=None):
+    jobs = all_jobs(username)
+    active = [j for j in jobs if j.get("status") not in {"completed", "failed", "cancelled"}]
+    if job_type:
+        active = [j for j in active if j.get("type") == job_type]
+    return max(active, key=lambda x: x.get("updated", "")) if active else None
 
 
-# -------------------- HISTORY STORE --------------------
-
-def add_history_entry(username, entry):
+def add_history(username, item):
     lock = _lock_for(history_file(username))
     with lock:
         items = load_json(history_file(username), [])
-        items.append(entry)
+        items.append(item)
         save_json(history_file(username), items)
 
 
@@ -409,1232 +329,618 @@ def prune_history(username):
             if ts >= cutoff:
                 kept.append(item)
             else:
-                out_path = Path(item.get("audio_path", ""))
-                if out_path.exists():
-                    try:
-                        out_path.unlink()
-                    except Exception:
-                        pass
+                Path(item.get("audio_path", "")).unlink(missing_ok=True)
         save_json(history_file(username), kept)
         return kept
 
 
-def get_history(username):
-    return prune_history(username)
+def create_share(username, job_id):
+    job = get_job(username, job_id)
+    if not job or not job.get("result_file") or not Path(job["result_file"]).exists():
+        return None
+    shares = load_json(SHARES_FILE, {})
+    token = uuid.uuid4().hex
+    shares[token] = {"username": username, "job_id": job_id, "created": datetime.now().isoformat(), "expires": (datetime.now() + timedelta(days=7)).isoformat()}
+    save_json(SHARES_FILE, shares)
+    return token
 
+
+def get_share(token):
+    shares = load_json(SHARES_FILE, {})
+    item = shares.get(token)
+    if not item:
+        return None
+    try:
+        if datetime.fromisoformat(item["expires"]) < datetime.now():
+            return None
+    except Exception:
+        return None
+    job = get_job(item["username"], item["job_id"])
+    if not job or not job.get("result_file") or not Path(job["result_file"]).exists():
+        return None
+    return item, job
 
 # -------------------- VOICE HELPERS --------------------
 
-SUPPORTED_VOICE_EXT = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
+def safe_filename(name):
+    cleaned = re.sub(r"[^A-Za-z0-9 _-]", "_", name).strip()
+    return cleaned or "audio"
 
 
-def get_saved_voices(username):
-    d = voice_dir(username)
+def saved_voices(username):
     return sorted(
-        [p for p in d.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_VOICE_EXT],
+        [p for p in voice_dir(username).iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_VOICE_EXT],
         key=lambda p: p.name.lower(),
     )
 
 
 def audio_duration_seconds(path: Path):
+    if path.suffix.lower() != ".wav":
+        return None
     try:
         import wave
-        if path.suffix.lower() == ".wav":
-            with wave.open(str(path), "rb") as wf:
-                frames = wf.getnframes()
-                rate = wf.getframerate()
-                return frames / float(rate) if rate else None
+        with wave.open(str(path), "rb") as wf:
+            return wf.getnframes() / float(wf.getframerate() or 1)
     except Exception:
-        pass
-    return None
+        return None
 
 
-def character_count(text: str) -> int:
-    return len(text)
-
-
-def safe_filename(name: str) -> str:
-    cleaned = "".join(c if c.isalnum() or c in (" ", "_", "-") else "_" for c in name).strip()
-    return cleaned or "audio"
-
-
-# -------------------- GENERATION ENGINE (backend detail, hidden from client UI) --------------------
-
-def _run_generation_job(username, job_id, text, voice_path_str, gen_username, gen_token):
-    def report(percent, message, status="generating"):
-        update_job(username, job_id, progress=max(0.0, min(100.0, float(percent))),
-                   message=message, status=status)
-
+def uploaded_audio_duration(uploaded):
+    suffix = Path(uploaded.name).suffix.lower()
+    if suffix != ".wav":
+        return None
+    tmp = Path(tempfile.mkstemp(suffix=suffix)[1])
     try:
-        report(2, "Preparing your request...", status="connecting")
+        tmp.write_bytes(uploaded.getbuffer())
+        return audio_duration_seconds(tmp)
+    finally:
+        tmp.unlink(missing_ok=True)
 
-        voice_file = Path(voice_path_str)
-        if not voice_file.exists() or voice_file.stat().st_size == 0:
+# -------------------- GENERATION BACKEND --------------------
+
+def verify_generation_credentials(username, token):
+    if not username.strip():
+        return False, False, "Enter a username."
+    if not token.strip():
+        return False, False, "Enter an API token."
+    env = os.environ.copy()
+    env["KAGGLE_USERNAME"] = username.strip()
+    env["KAGGLE_API_TOKEN"] = token.strip()
+    env["KAGGLE_KEY"] = token.strip()
+    try:
+        r = subprocess.run(["kaggle", "kernels", "list", "--mine"], env=env, capture_output=True, text=True, timeout=30, check=False)
+        combined = ((r.stdout or "") + (r.stderr or "")).lower()
+        if r.returncode == 0:
+            return True, True, None
+        if "401" in combined or "unauthorized" in combined or "invalid" in combined:
+            return False, False, None
+        return False, False, "Could not verify right now. Please try again."
+    except FileNotFoundError:
+        return False, False, "Verification tool is unavailable on this server."
+    except Exception:
+        return False, False, "Could not verify right now. Please try again."
+
+
+def run_generation_job(username, job_id, text, voice_path, gen_username, gen_token):
+    def report(pct, msg, status="generating"):
+        update_job(username, job_id, progress=float(max(0, min(100, pct))), message=msg, status=status)
+    try:
+        voice_file = Path(voice_path)
+        if not voice_file.exists():
             update_job(username, job_id, status="failed", error="The selected voice is missing. Please re-upload it.")
             return
         if not gen_username or not gen_token:
-            update_job(username, job_id, status="failed", error="Generation is not configured for this account yet.")
+            update_job(username, job_id, status="failed", error="Generation is not connected yet. Please open Settings.")
             return
 
+        report(3, "Preparing your request...", "connecting")
         voice_b64 = base64.b64encode(voice_file.read_bytes()).decode("ascii")
         text_json = json.dumps(text, ensure_ascii=False)
-        raw_slug = f"zui-{username.lower()}-{job_id[:10]}"
-        kernel_slug = "".join(c if c.isalnum() or c == "-" else "-" for c in raw_slug).strip("-")[:80]
-
-        report(10, "Connecting to server...", status="connecting")
-        workspace = Path(tempfile.mkdtemp(prefix="zui_job_"))
+        kernel_slug = re.sub(r"[^a-z0-9-]", "-", f"zaiko-{username.lower()}-{job_id[:10]}").strip("-")[:80]
+        workspace = Path(tempfile.mkdtemp(prefix="zaiko_job_"))
+        output_dir = Path(tempfile.mkdtemp(prefix="zaiko_output_"))
         notebook_path = workspace / "active_worker.ipynb"
         metadata_path = workspace / "kernel-metadata.json"
-        output_dir = Path(tempfile.mkdtemp(prefix="zui_job_output_"))
 
-        notebook_source = """import base64
-import json
-import subprocess
-import sys
+        source = """import base64, json, subprocess, sys
 from pathlib import Path
-
-OUTPUT = Path('/kaggle/working')
-STATUS = OUTPUT / 'status.json'
-AUDIO = OUTPUT / 'generated.wav'
-VOICE = OUTPUT / 'reference_voice.wav'
-
-TEXT = __TEXT_JSON__
-VOICE_B64 = __VOICE_B64__
-
-
-def write_status(status, message='', percent=None):
-    payload = {'status': status, 'message': message}
-    if percent is not None:
-        payload['percent'] = float(percent)
-    STATUS.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
-
-
-class LiveChunkProgress:
-    def tqdm(self, iterable, *args, **kwargs):
-        items = list(iterable)
-        total = len(items)
-        if total == 0:
-            return
-        for index, item in enumerate(items, 1):
-            yield item
-            percent = (index / total) * 100.0
-            write_status('generating', f'chunk {index}/{total}', percent=percent)
-            print(f'PROGRESS {index}/{total} {percent:.1f}%', flush=True)
-
-
+OUTPUT=Path('/kaggle/working'); STATUS=OUTPUT/'status.json'; AUDIO=OUTPUT/'generated.wav'; VOICE=OUTPUT/'reference_voice.wav'
+TEXT=__TEXT_JSON__; VOICE_B64=__VOICE_B64__
+def write_status(status,message='',percent=None):
+    d={'status':status,'message':message}
+    if percent is not None:d['percent']=float(percent)
+    STATUS.write_text(json.dumps(d,ensure_ascii=False),encoding='utf-8')
+class LiveProgress:
+    def tqdm(self, iterable,*args,**kwargs):
+        items=list(iterable); total=len(items)
+        if total==0:return
+        for i,item in enumerate(items,1):
+            yield item; pct=(i/total)*100.0; write_status('generating',f'chunk {i}/{total}',pct); print(f'PROGRESS {i}/{total} {pct:.1f}%',flush=True)
 try:
-    write_status('starting', 'Preparing engine', percent=0)
-    VOICE.write_bytes(base64.b64decode(VOICE_B64))
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'f5-tts'])
-    write_status('generating', 'Generation started', percent=0)
-    print('GENERATION STARTED 0.0%', flush=True)
-
+    write_status('starting','Preparing engine',0); VOICE.write_bytes(base64.b64decode(VOICE_B64)); subprocess.check_call([sys.executable,'-m','pip','install','-q','f5-tts']); write_status('generating','Generation started',0)
     from f5_tts.api import F5TTS
-
-    tts = F5TTS(model='F5TTS_v1_Base', device='cuda')
-    progress = LiveChunkProgress()
-    tts.infer(
-        ref_file=str(VOICE), ref_text='', gen_text=TEXT, progress=progress,
-        file_wave=str(AUDIO), remove_silence=False,
-    )
-
-    if not AUDIO.exists() or AUDIO.stat().st_size < 1000:
-        raise RuntimeError('Generation finished without producing a valid audio file.')
-
-    write_status('success', 'Audio generated successfully', percent=100.0)
-    print('GENERATION COMPLETE 100.0%', flush=True)
+    tts=F5TTS(model='F5TTS_v1_Base',device='cuda'); progress=LiveProgress(); tts.infer(ref_file=str(VOICE),ref_text='',gen_text=TEXT,progress=progress,file_wave=str(AUDIO),remove_silence=False)
+    if not AUDIO.exists() or AUDIO.stat().st_size<1000: raise RuntimeError('No valid audio was produced.')
+    write_status('success','Audio generated successfully',100); print('GENERATION COMPLETE 100.0%',flush=True)
 except Exception as exc:
-    write_status('error', repr(exc))
-    print('GENERATION ERROR:', repr(exc), flush=True)
+    write_status('error',repr(exc)); print('GENERATION ERROR:',repr(exc),flush=True)
 """
-        notebook_source = notebook_source.replace("__TEXT_JSON__", text_json).replace("__VOICE_B64__", repr(voice_b64))
-        notebook = {
-            "cells": [{"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
-                       "source": notebook_source.splitlines(True)}],
-            "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-                         "language_info": {"name": "python"}},
-            "nbformat": 4, "nbformat_minor": 5,
-        }
-        notebook_path.write_text(json.dumps(notebook, indent=2, ensure_ascii=False), encoding="utf-8")
-
-        metadata = {
-            "id": f"{gen_username}/{kernel_slug}", "title": kernel_slug, "code_file": "active_worker.ipynb",
-            "language": "python", "kernel_type": "notebook", "is_private": True, "enable_gpu": True,
-            "enable_internet": True, "machine_shape": "NvidiaTeslaT4",
-            "dataset_sources": [], "competition_sources": [], "kernel_sources": [], "model_sources": [],
-        }
+        source = source.replace("__TEXT_JSON__", text_json).replace("__VOICE_B64__", repr(voice_b64))
+        notebook = {"cells":[{"cell_type":"code","execution_count":None,"metadata":{},"outputs":[],"source":source.splitlines(True)}],"metadata":{"kernelspec":{"display_name":"Python 3","language":"python","name":"python3"},"language_info":{"name":"python"}},"nbformat":4,"nbformat_minor":5}
+        notebook_path.write_text(json.dumps(notebook, indent=2), encoding="utf-8")
+        metadata = {"id":f"{gen_username}/{kernel_slug}","title":kernel_slug,"code_file":"active_worker.ipynb","language":"python","kernel_type":"notebook","is_private":True,"enable_gpu":True,"enable_internet":True,"machine_shape":"NvidiaTeslaT4","dataset_sources":[],"competition_sources":[],"kernel_sources":[],"model_sources":[]}
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-
-        env = os.environ.copy()
-        env["KAGGLE_USERNAME"] = gen_username
-        env["KAGGLE_API_TOKEN"] = gen_token
-        env["KAGGLE_KEY"] = gen_token
-
-        report(20, "Connected to server", status="connected")
-        report(25, "Generating your speech...", status="generating")
-
-        pushed = subprocess.run(["kaggle", "kernels", "push", "-p", str(workspace)], env=env,
-                                 capture_output=True, text=True, check=False)
-        if pushed.returncode != 0:
-            update_job(username, job_id, status="failed", error="We couldn't start your generation. Please try again.")
-            return
-
-        kernel_ref = f"{gen_username}/{kernel_slug}"
-        last_progress = 25
-        started = False
-
-        def probe_output():
-            probe_dir = Path(tempfile.mkdtemp(prefix="zui_probe_"))
+        env=os.environ.copy(); env["KAGGLE_USERNAME"]=gen_username; env["KAGGLE_API_TOKEN"]=gen_token; env["KAGGLE_KEY"]=gen_token
+        report(12,"Connecting to server...","connecting")
+        pushed=subprocess.run(["kaggle","kernels","push","-p",str(workspace)],env=env,capture_output=True,text=True,check=False)
+        if pushed.returncode!=0:
+            update_job(username,job_id,status="failed",error="We couldn't start your generation. Please try again."); return
+        report(18,"Connected to server","connected")
+        report(25,"Generating your speech...","generating")
+        kernel_ref=f"{gen_username}/{kernel_slug}"
+        last_progress=25.0
+        for _ in range(240):
+            probe_dir=Path(tempfile.mkdtemp(prefix="zaiko_probe_"))
             try:
-                probe = subprocess.run(
-                    ["kaggle", "kernels", "output", kernel_ref, "-p", str(probe_dir), "-o", "-q"],
-                    env=env, capture_output=True, text=True, check=False,
-                )
-                status_candidates = list(probe_dir.rglob("status.json"))
-                audio_candidates = list(probe_dir.rglob("generated.wav"))
-                status_payload = None
-                if status_candidates:
-                    try:
-                        status_payload = json.loads(status_candidates[0].read_text(encoding="utf-8"))
-                    except Exception:
-                        status_payload = None
-                return status_payload, bool(audio_candidates)
-            finally:
-                shutil.rmtree(probe_dir, ignore_errors=True)
-
-        final_state = None
-        restart_count = 0
-
-        while True:
-            log_process = subprocess.Popen(
-                ["kaggle", "kernels", "logs", kernel_ref, "--follow"],
-                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-            )
-            try:
-                while True:
-                    ready, _, _ = select.select([log_process.stdout], [], [], 2.0)
-                    if ready:
-                        line = log_process.stdout.readline()
-                        if not line:
-                            break
-                        upper = line.upper()
-                        if any(m in upper for m in ("KERNEL FAILED", "TRACEBACK", "RUNTIMEERROR", "EXCEPTION", "CANCELLED")):
-                            final_state = "error"
-                            break
-                        match = re.search(r"PROGRESS\s+(\d+)\s*/\s*(\d+)\s+(\d+(?:\.\d+)?)%", line)
-                        if match:
-                            started = True
-                            pct = float(match.group(3))
-                            last_progress = max(25, pct)
-                            report(last_progress, "Generating your speech...")
-                        elif started:
-                            report(last_progress, "Generating your speech...")
-                        else:
-                            report(20, "Connecting to server...")
-                    elif log_process.poll() is not None:
-                        break
-            finally:
-                if log_process.stdout:
-                    log_process.stdout.close()
-                if log_process.poll() is None:
-                    log_process.terminate()
-                    log_process.wait()
-
-            if final_state == "error":
-                break
-
-            status_payload, audio_ready = probe_output()
-            if status_payload:
-                if status_payload.get("status") == "error":
-                    final_state = "error"
-                    break
-                if status_payload.get("status") == "success" and audio_ready:
-                    final_state = "complete"
-                    break
-            if audio_ready:
-                final_state = "complete"
-                break
-
-            restart_count += 1
-            if restart_count > 200:
-                final_state = "error"
-                break
-            report(last_progress, "Generating your speech...")
-            time.sleep(2)
-
-        if final_state == "error":
-            update_job(username, job_id, status="failed", error="Generation could not be completed. Please try again.")
-            return
-
-        report(92, "Finishing up...")
-        download = subprocess.run(["kaggle", "kernels", "output", kernel_ref, "-p", str(output_dir), "-o", "-q"],
-                                   env=env, capture_output=True, text=True, check=False)
-        if download.returncode != 0:
-            update_job(username, job_id, status="failed", error="Generation finished, but the result could not be retrieved.")
-            return
-
-        audio_files = list(output_dir.rglob("generated.wav"))
-        if not audio_files:
-            update_job(username, job_id, status="failed", error="Generation finished, but no audio was produced.")
-            return
-        audio_bytes = audio_files[0].read_bytes()
-        if len(audio_bytes) < 1000 or not audio_bytes.startswith(b"RIFF"):
-            update_job(username, job_id, status="failed", error="Generation produced an invalid audio file.")
-            return
-
-        job = get_job(username, job_id) or {}
-        title = job.get("title") or "Untitled"
-        result_path = outputs_dir(username) / f"{job_id}.wav"
-        result_path.write_bytes(audio_bytes)
-
-        update_job(username, job_id, status="completed", progress=100.0,
-                   message="Speech generated successfully.", result_file=str(result_path))
-
+                probe=subprocess.run(["kaggle","kernels","output",kernel_ref,"-p",str(probe_dir),"-o","-q"],env=env,capture_output=True,text=True,check=False,timeout=30)
+                statuses=list(probe_dir.rglob("status.json")); audios=list(probe_dir.rglob("generated.wav"))
+                payload=None
+                if statuses:
+                    try: payload=json.loads(statuses[0].read_text(encoding="utf-8"))
+                    except Exception: payload=None
+                if payload:
+                    pct=float(payload.get("percent",last_progress)); last_progress=max(last_progress,min(90,pct))
+                    report(last_progress,"Generating your speech...","generating")
+                    if payload.get("status")=="error":
+                        update_job(username,job_id,status="failed",error="Generation could not be completed. Please try again."); return
+                    if payload.get("status")=="success" and audios: break
+                if audios: break
+            except Exception:
+                pass
+            finally: shutil.rmtree(probe_dir,ignore_errors=True)
+            time.sleep(3)
+        else:
+            update_job(username,job_id,status="failed",error="Generation took too long and was stopped. Please try again."); return
+        report(94,"Finishing up...","finishing")
+        download=subprocess.run(["kaggle","kernels","output",kernel_ref,"-p",str(output_dir),"-o","-q"],env=env,capture_output=True,text=True,check=False,timeout=60)
+        audio_files=list(output_dir.rglob("generated.wav"))
+        if download.returncode!=0 or not audio_files:
+            update_job(username,job_id,status="failed",error="Generation finished, but the result could not be retrieved."); return
+        audio_bytes=audio_files[0].read_bytes()
+        if len(audio_bytes)<1000 or not audio_bytes.startswith(b"RIFF"):
+            update_job(username,job_id,status="failed",error="Generation produced an invalid audio file."); return
+        result=outputs_dir(username)/f"{job_id}.wav"; result.write_bytes(audio_bytes)
+        update_job(username,job_id,status="completed",progress=100.0,message="Speech generated successfully.",result_file=str(result))
     except FileNotFoundError:
-        update_job(username, job_id, status="failed", error="The generation service is not available right now.")
+        update_job(username,job_id,status="failed",error="The generation service is not available right now.")
     except Exception:
-        update_job(username, job_id, status="failed", error="Something went wrong during generation. Please try again.")
+        update_job(username,job_id,status="failed",error="Something went wrong during generation. Please try again.")
+    finally:
+        try: shutil.rmtree(workspace,ignore_errors=True)
+        except Exception: pass
+        try: shutil.rmtree(output_dir,ignore_errors=True)
+        except Exception: pass
 
 
-def start_generation_job(username, text, title, voice_path, gen_username, gen_token, char_count):
-    job_id = create_job(username, "tts", {
-        "text": text, "title": title, "voice_path": str(voice_path),
-        "voice_name": Path(voice_path).stem, "chars": char_count,
-    })
-    thread = threading.Thread(
-        target=_run_generation_job,
-        args=(username, job_id, text, str(voice_path), gen_username, gen_token),
-        daemon=True,
-    )
-    thread.start()
-    return job_id
+def start_generation(username,text,title,voice_path,gen_username,gen_token,char_count):
+    jid=create_job(username,"tts",{"text":text,"title":title,"voice_path":str(voice_path),"voice_name":Path(voice_path).stem,"chars":char_count})
+    threading.Thread(target=run_generation_job,args=(username,jid,text,str(voice_path),gen_username,gen_token),daemon=True).start()
+    return jid
 
+# -------------------- CREDITS --------------------
 
-# -------------------- CREDIT HANDLING (idempotent) --------------------
-
-def charge_credits_once(user_db, account_profile, username, job_id, chars):
-    job = get_job(username, job_id)
-    if not job or job.get("credits_charged"):
-        return True
-    current = int(account_profile.get("remaining_chars", 0))
-    if chars > current:
-        return False
-    account_profile["remaining_chars"] = current - chars
-    if push_database_updates(user_db):
-        update_job(username, job_id, credits_charged=True)
+def charge_once(db, profile, username, jid, chars):
+    job=get_job(username,jid)
+    if not job or job.get("credits_charged"): return True
+    remaining=int(profile.get("remaining_chars",0)); chars=int(chars or 0)
+    if chars>remaining:return False
+    profile["remaining_chars"]=remaining-chars
+    if push_database_updates(db):
+        update_job(username,jid,credits_charged=True)
         return True
     return False
 
-
-# -------------------- STYLE --------------------
-
-st.markdown(
-    """
+# -------------------- UI --------------------
+st.markdown("""
 <style>
-#MainMenu, header[data-testid="stHeader"] {visibility: visible;}
-.main {background: #060912;}
-.block-container {padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1100px;}
-
-.zui-header {
-    position: sticky; top: 0; z-index: 999;
-    background: linear-gradient(135deg, rgba(10,14,26,0.96), rgba(15,25,45,0.96));
-    border: 1px solid rgba(80,180,255,0.18);
-    border-radius: 18px;
-    padding: 16px 22px;
-    margin-bottom: 20px;
-    box-shadow: 0 8px 30px rgba(0,0,0,.35), 0 0 40px rgba(120,80,255,.06);
-    backdrop-filter: blur(6px);
-}
-.zui-brand {
-    font-size: 1.35rem; font-weight: 800; letter-spacing: .5px;
-    background: linear-gradient(90deg, #5ee7ff, #8a7bff);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-}
-.zui-metric-row {display: flex; gap: 26px; flex-wrap: wrap; margin-top: 6px;}
-.zui-metric-label {font-size: .72rem; color: #7f8bab; text-transform: uppercase; letter-spacing: .06em;}
-.zui-metric-value {font-size: 1.05rem; color: #e8ecff; font-weight: 700;}
-
-.card {
-    padding: 22px; border-radius: 18px;
-    background: rgba(20,26,45,.72);
-    border: 1px solid rgba(255,255,255,.06);
-    margin-bottom: 18px;
-    box-shadow: 0 6px 22px rgba(0,0,0,.25);
-}
-.card:hover {border-color: rgba(94,231,255,.25);}
-
-.zui-nav-active {
-    color: #5ee7ff !important; font-weight: 700 !important;
-    background: rgba(94,231,255,.08);
-    border-radius: 10px;
-}
-
-.zui-footer {
-    margin-top: 40px; padding: 22px; text-align: center;
-    color: #8892b0; border-top: 1px solid rgba(255,255,255,.06);
-}
-.zui-footer a {color: #5ee7ff; text-decoration: none; font-weight: 600;}
-
-.zui-history-scroll {
-    max-height: 560px; overflow-y: auto; padding-right: 8px;
-}
-
-.small-muted {opacity: .7; font-size: .85rem;}
-
-textarea[aria-label="Enter Your Text"] {
-    height: 260px !important;
-    max-height: 260px !important;
-    overflow-y: auto !important;
-}
-
-.stButton>button:disabled {
-    background: #1b2338 !important; color: #55607f !important;
-    border: 1px solid rgba(255,255,255,.05) !important;
-}
+:root{--bg:#050a14;--panel:#0b1324;--panel2:#0e1a2d;--line:rgba(111,210,255,.16);--text:#eef7ff;--muted:#91a4bd;--cyan:#56dcff;--purple:#8b7cff}
+html,body,[data-testid="stAppViewContainer"],[data-testid="stApp"]{background:radial-gradient(circle at 80% -10%,rgba(92,86,255,.12),transparent 34%),radial-gradient(circle at 10% 10%,rgba(0,210,255,.08),transparent 30%),var(--bg);color:var(--text)}
+.block-container{max-width:1180px;padding-top:6.5rem;padding-bottom:2.5rem}
+header[data-testid="stHeader"]{background:transparent}
+[data-testid="stSidebar"]{background:#070e1b;border-right:1px solid var(--line)}
+.brand{font-weight:900;letter-spacing:.7px;font-size:1.25rem;background:linear-gradient(90deg,#56dcff,#8b7cff,#ff76cf);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.zhead{position:fixed;top:0;left:0;right:0;z-index:9999;background:rgba(5,10,20,.91);backdrop-filter:blur(18px);border-bottom:1px solid var(--line);padding:12px 22px;min-height:66px;display:flex;align-items:center;justify-content:space-between;gap:18px}
+.head-brand{display:flex;align-items:center;gap:12px}.hamb{font-size:1.35rem;color:#bfeeff}
+.metrics{display:flex;gap:26px;align-items:center;justify-content:flex-end;flex-wrap:wrap}.metric-label{font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;color:#7287a3}.metric-value{font-weight:800;color:#f2f7ff;font-size:.92rem}
+.card,.hero{background:linear-gradient(145deg,rgba(14,26,46,.94),rgba(8,18,33,.91));border:1px solid rgba(126,211,255,.12);border-radius:20px;padding:24px;margin-bottom:18px;box-shadow:0 18px 45px rgba(0,0,0,.25)}
+.card:hover{border-color:rgba(86,220,255,.22)}.hero h1{margin:0 0 6px}.muted,.small{color:var(--muted)}
+.footer{text-align:center;margin-top:48px;padding:28px 10px;color:#8193aa;border-top:1px solid rgba(255,255,255,.07)}
+.wa{display:inline-block;margin-top:10px;padding:10px 17px;border-radius:12px;border:1px solid rgba(86,220,255,.28);background:rgba(86,220,255,.08);color:#9eeaff!important;text-decoration:none;font-weight:800}
+.login-wrap{max-width:520px;margin:7vh auto}.login-brand{text-align:center;font-size:2rem}.typewriter{min-height:86px;text-align:center;font-size:1.35rem;font-weight:900;line-height:1.45;background:linear-gradient(90deg,#56dcff,#8b7cff,#ff76cf);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin:22px 0 26px}
+.section-title{font-size:1.1rem;font-weight:800;margin:2px 0 14px}.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#5ff2a8;box-shadow:0 0 12px #5ff2a8;margin-right:7px}
+.stButton>button{border-radius:12px;border:1px solid rgba(86,220,255,.18);min-height:44px}.stButton>button:disabled{background:#172238!important;color:#596982!important}
+textarea[aria-label="Enter Your Text"]{height:260px!important;max-height:260px!important;overflow-y:auto!important}
+[data-testid="stMetric"]{background:rgba(14,26,46,.68);border:1px solid rgba(126,211,255,.10);border-radius:16px;padding:14px}
+@media(max-width:760px){.block-container{padding-top:7rem}.zhead{padding:10px 12px;align-items:flex-start}.metrics{gap:9px;justify-content:flex-end}.metric-value{font-size:.76rem}.metric-label{font-size:.55rem}.head-brand .brand{font-size:1rem}.hero,.card{padding:18px;border-radius:16px}.login-wrap{margin:4vh auto}.typewriter{font-size:1.05rem}}
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""",unsafe_allow_html=True)
 
-# -------------------- SESSION STATE DEFAULTS --------------------
+# -------------------- SESSION STATE --------------------
+for k,v in {"auth_session":False,"current_user":"","session_id":"","page":"Dashboard","menu_open":False,"show_token":False}.items():
+    if k not in st.session_state: st.session_state[k]=v
 
-defaults = {
-    "auth_checked": False,
-    "auth_session": False,
-    "current_user": "",
-    "menu_open": False,
-}
-for key, default in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+# Public share route works without exposing credentials.
+share_token=st.query_params.get("share")
+if share_token:
+    shared=get_share(share_token)
+    if shared:
+        _, job=shared
+        st.markdown(f'<div class="login-wrap"><div class="login-brand brand">{BRAND}</div><div class="card"><h2>{html.escape(job.get("title","Shared Audio"))}</h2><p class="small">Voice: {html.escape(job.get("voice_name",""))}</p>',unsafe_allow_html=True)
+        audio=Path(job["result_file"])
+        st.audio(audio.read_bytes(),format="audio/wav")
+        st.download_button("Download Audio",audio.read_bytes(),file_name=f'{safe_filename(job.get("title","audio"))}.wav',mime="audio/wav",use_container_width=True)
+        st.markdown('</div></div>',unsafe_allow_html=True)
+    else:
+        st.error("This shared audio link has expired or is no longer available.")
+    st.stop()
 
-user_db = fetch_live_database()
+user_db=fetch_live_database()
 
-# -------------------- RESTORE SESSION FROM COOKIE --------------------
-
+# -------------------- AUTH RESTORE --------------------
 if not st.session_state.auth_session:
-    sid = get_cookie_session_id()
-    if sid:
-        username = resolve_session(sid)
-        if username and username in user_db and not user_db[username].get("is_revoked", False):
-            st.session_state.auth_session = True
-            st.session_state.current_user = username
-            st.session_state.session_id = sid
-            touch_session(sid)
-
-# -------------------- PAGE RESTORE (identifier only, never credentials) --------------------
-
-def restore_page(valid_pages):
-    requested = st.query_params.get("page")
-    if requested in valid_pages:
-        return requested
-    return valid_pages[0]
+    sid=cookie_session_id()
+    username=resolve_session(sid) if sid else None
+    if username and username in user_db and not user_db[username].get("is_revoked",False):
+        st.session_state.auth_session=True; st.session_state.current_user=username; st.session_state.session_id=sid; touch_session(sid)
 
 
-def set_page_param(page_name):
-    st.query_params["page"] = page_name
-
-
-# ============================================================
-# LOGIN
-# ============================================================
-
-def render_login():
+def login_page():
+    # Credentials are never written to query parameters.
     st.query_params.clear()
-
-    st.markdown(
-        """
-        <div class="zui-header" style="text-align:center;">
-            <div class="zui-brand" style="font-size:2rem;">ZAKO AI Studio</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    components.html(
-        """
-        <div id="typewriter" style="text-align:center;font-family:'Segoe UI',sans-serif;
-             font-weight:700;font-size:1.4rem;min-height:2.2rem;margin-bottom:18px;
-             background:linear-gradient(90deg,#5ee7ff,#8a7bff,#ff7bd0);
-             -webkit-background-clip:text;-webkit-text-fill-color:transparent;"></div>
-        <script>
-        const lines = [
-            "Give Your Words a Voice.",
-            "Turn Text Into Natural Speech.",
-            "Where Every Word Comes Alive.",
-            "Speak. Create. Inspire."
-        ];
-        let li = 0, ci = 0, deleting = false;
-        const el = document.getElementById("typewriter");
-        function tick() {
-            const current = lines[li];
-            if (!deleting) {
-                ci++;
-                el.textContent = current.slice(0, ci);
-                if (ci === current.length) { deleting = true; setTimeout(tick, 1400); return; }
-            } else {
-                ci--;
-                el.textContent = current.slice(0, ci);
-                if (ci === 0) { deleting = false; li = (li + 1) % lines.length; }
-            }
-            setTimeout(tick, deleting ? 35 : 65);
-        }
-        tick();
-        </script>
-        """,
-        height=70,
-    )
-
-    col_a, col_b, col_c = st.columns([1, 1.2, 1])
-    with col_b:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### Welcome back")
-        with st.form("login_form"):
-            username_input = st.text_input("Username").upper().strip()
-            password_input = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Sign In", use_container_width=True, type="primary")
-
-            if submitted:
-                if username_input not in user_db:
-                    st.error("Invalid username or password.")
-                else:
-                    target = user_db[username_input]
-                    if target.get("is_revoked", False):
-                        st.error("This account no longer has access. Please contact support.")
-                    elif target.get("password") != password_input:
-                        st.error("Invalid username or password.")
-                    else:
-                        try:
-                            exp_time = datetime.strptime(target["expiry_timestamp"], "%Y-%m-%d %H:%M:%S")
-                        except Exception:
-                            exp_time = datetime.now() + timedelta(days=1)
-                        if exp_time < datetime.now() and not target.get("is_admin", False):
-                            st.error("Your plan has expired. Please contact support to renew.")
-                        else:
-                            sid = create_session(username_input)
-                            st.session_state.auth_session = True
-                            st.session_state.current_user = username_input
-                            st.session_state.session_id = sid
-                            set_session_cookie(sid)
-                            st.stop()
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown(
-            f"""
-            <div class="card" style="text-align:center;">
-                <div style="font-weight:700;margin-bottom:6px;">Need access?</div>
-                <div class="small-muted">{ADMIN_CONTACT_NAME} · {WHATSAPP_DISPLAY}</div>
-                <a href="https://wa.me/{WHATSAPP_NUMBER_INTL}?text={requests.utils.quote(
-                    f'Hi {ADMIN_CONTACT_NAME}, I want to request access to ZAKO AI Studio.'
-                )}" target="_blank">
-                    <button style="margin-top:10px;padding:10px 18px;border-radius:10px;
-                        border:1px solid rgba(94,231,255,.35);background:rgba(94,231,255,.08);
-                        color:#5ee7ff;font-weight:700;cursor:pointer;">
-                        💬 Contact on WhatsApp
-                    </button>
-                </a>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
+    st.markdown(f'''<div class="login-wrap">
+      <div class="login-brand brand">{BRAND}</div>
+      <div id="typewriter" class="typewriter"></div>
+      <div class="card"><h2 style="margin-top:0">Welcome back</h2>''',unsafe_allow_html=True)
+    components.html('''<script>
+      const lines=["Give Your Words a Voice.","Turn Text Into Natural Speech.","Where Every Word Comes Alive.","Speak. Create. Inspire."];
+      let i=0,n=0,del=false; const root=window.parent.document.getElementById('typewriter');
+      function tick(){if(!root)return;const s=lines[i];if(!del){n++;root.textContent=s.slice(0,n);if(n===s.length){del=true;setTimeout(tick,1400);return}}else{n--;root.textContent=s.slice(0,n);if(n===0){del=false;i=(i+1)%lines.length}}setTimeout(tick,del?34:62)} tick();
+    </script>''',height=0)
+    with st.form("login_form"):
+        username=st.text_input("Username",key="login_user").upper().strip()
+        password=st.text_input("Password",type="password",key="login_pass")
+        submitted=st.form_submit_button("Sign In",type="primary",use_container_width=True)
+    if submitted:
+        target=user_db.get(username)
+        if not target or target.get("password")!=password:
+            st.error("Invalid username or password.")
+        elif target.get("is_revoked"):
+            st.error("This account no longer has access. Please contact support.")
+        else:
+            try: exp=datetime.strptime(target.get("expiry_timestamp",""),"%Y-%m-%d %H:%M:%S")
+            except Exception: exp=datetime.now()+timedelta(days=1)
+            if exp<datetime.now() and not target.get("is_admin",False): st.error("Your plan has expired. Please contact support to renew.")
+            else:
+                sid=create_session(username); st.session_state.auth_session=True; st.session_state.current_user=username; st.session_state.session_id=sid; st.session_state.page="Dashboard"; set_cookie(sid); st.stop()
+    st.markdown('</div>',unsafe_allow_html=True)
+    msg=quote(f"Hi {ADMIN_CONTACT_NAME}, I want to request access to {BRAND}.")
+    st.markdown(f'''<div class="card" style="text-align:center"><div style="font-weight:800">Need access?</div><div class="small">{ADMIN_CONTACT_NAME}</div><a class="wa" href="https://wa.me/{WHATSAPP_NUMBER_INTL}?text={msg}" target="_blank">💬 Contact on WhatsApp</a></div></div>''',unsafe_allow_html=True)
 
 if not st.session_state.auth_session:
-    render_login()
-    st.stop()
+    login_page(); st.stop()
+
+active_username=st.session_state.current_user
+if active_username not in user_db or user_db[active_username].get("is_revoked",False):
+    remove_session(st.session_state.session_id); st.session_state.auth_session=False; st.session_state.current_user=""; clear_cookie(); st.stop()
+profile=user_db[active_username]; is_admin=bool(profile.get("is_admin",False)); valid_pages=ADMIN_PAGES if is_admin else CLIENT_PAGES
+requested_page=st.query_params.get("page")
+if requested_page in valid_pages: st.session_state.page=requested_page
+if st.session_state.page not in valid_pages: st.session_state.page=valid_pages[0]
+page=st.session_state.page
 
 
-# ============================================================
-# ACTIVE PROFILE
-# ============================================================
-
-active_username = st.session_state.current_user
-
-if active_username not in user_db:
-    remove_session(st.session_state.get("session_id", ""))
-    st.session_state.auth_session = False
-    clear_session_cookie()
-    st.stop()
-
-account_profile = user_db[active_username]
-is_admin = account_profile.get("is_admin", False)
-
-if account_profile.get("is_revoked", False):
-    remove_session(st.session_state.get("session_id", ""))
-    st.session_state.auth_session = False
-    clear_session_cookie()
-    st.error("Access revoked. Please contact support.")
-    st.stop()
-
-valid_pages = VALID_PAGES_ADMIN if is_admin else VALID_PAGES_CLIENT
-page = restore_page(valid_pages)
+def goto(p):
+    st.session_state.page=p; st.query_params["page"]=p; st.rerun()
 
 
-def do_logout():
-    remove_session(st.session_state.get("session_id", ""))
-    st.session_state.auth_session = False
-    st.session_state.current_user = ""
-    clear_session_cookie()
+def logout():
+    remove_session(st.session_state.get("session_id",""))
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    st.query_params.clear(); clear_cookie()
 
 
-# -------------------- NAVIGATION (sidebar doubles as hamburger drawer on mobile) --------------------
-
-with st.sidebar:
-    st.markdown('<div class="zui-brand" style="font-size:1.3rem;">☰ ZAKO AI Studio</div>', unsafe_allow_html=True)
-    st.caption(active_username.title())
-    st.divider()
-
-    for item in valid_pages:
-        icon = PAGE_ICONS.get(item, "•")
-        active = (item == page)
-        label = f"**{icon} {item}**" if active else f"{icon} {item}"
-        if st.button(label, key=f"nav_{item}", use_container_width=True):
-            set_page_param(item)
-            st.rerun()
-
-    st.divider()
-    if st.button("🚪 Logout", key="nav_logout", use_container_width=True):
-        do_logout()
-        st.rerun()
+def expiry_dt():
+    try:return datetime.strptime(profile.get("expiry_timestamp",""),"%Y-%m-%d %H:%M:%S")
+    except Exception:return datetime.now()
 
 
-def render_footer():
-    msg = requests.utils.quote("Hi, I want to know more about ZAKO AI Studio.")
-    st.markdown(
-        f"""
-        <div class="zui-footer">
-            <div class="zui-brand" style="font-size:1.1rem;">Z UI Studio</div>
-            <div class="small-muted">Built by Anil Zacharia</div>
-            <div style="margin-top:8px;">
-                <a href="https://wa.me/{WHATSAPP_NUMBER_INTL}?text={msg}" target="_blank">
-                    WhatsApp: {WHATSAPP_DISPLAY}
-                </a>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def header():
+    if page=="History" and not is_admin:
+        items=prune_history(active_username); dates=[]
+        for x in items:
+            try: dates.append(datetime.fromisoformat(x["generated_at"]).date())
+            except Exception: pass
+        rng=f'{min(dates).strftime("%d %b %Y")} – {max(dates).strftime("%d %b %Y")}' if dates else "No history"
+        metrics=f'''<div class="metrics"><div><div class="metric-label">Total Voices Generated</div><div class="metric-value">{len(items):,}</div></div><div><div class="metric-label">Voices Available in History</div><div class="metric-value">{len(items):,}</div></div><div><div class="metric-label">Available History</div><div class="metric-value">{rng}</div></div></div>'''
+    else:
+        exp=expiry_dt(); left=max(0,int((exp-datetime.now()).total_seconds())); d,left=divmod(left,86400); h,left=divmod(left,3600); m,s=divmod(left,60)
+        total=int(profile.get("total_credits_allocated",profile.get("total_limit",0))); rem=int(profile.get("remaining_chars",0))
+        metrics=f'''<div class="metrics"><div><div class="metric-label">Total Credits</div><div class="metric-value">{total:,}</div></div><div><div class="metric-label">Remaining Credits</div><div class="metric-value">{rem:,}</div></div><div><div class="metric-label">Plan Expiry</div><div class="metric-value" id="expiry-count">{d} Days {h} Hours {m} Minutes {s} Seconds</div><div class="small">Expires: {exp.strftime("%d %b %Y, %I:%M %p")}</div></div></div>'''
+    st.markdown(f'''<div class="zhead"><div class="head-brand"><span class="hamb">☰</span><span class="brand">{BRAND}</span></div>{metrics}</div>''',unsafe_allow_html=True)
+    if page!="History" and not is_admin:
+        iso=expiry_dt().isoformat()
+        components.html(f'''<script>
+        const ex=new Date("{iso}"); function t(){{let x=Math.max(0,Math.floor((ex-new Date())/1000));let d=Math.floor(x/86400);x%=86400;let h=Math.floor(x/3600);x%=3600;let m=Math.floor(x/60),s=x%60;let e=window.parent.document.getElementById('expiry-count');if(e)e.textContent=`${{d}} Days ${{h}} Hours ${{m}} Minutes ${{s}} Seconds`;}}t();setInterval(t,1000);
+        </script>''',height=0)
 
 
-def render_header(show_credits=True):
-    remaining = int(account_profile.get("remaining_chars", 0))
-    total = int(account_profile.get("total_limit", 0))
-    expiry_raw = account_profile.get("expiry_timestamp", "")
-
-    metrics_html = f'<div class="zui-metric-row">'
-    if show_credits:
-        metrics_html += f"""
-            <div><div class="zui-metric-label">Total Credits</div><div class="zui-metric-value">{total:,}</div></div>
-            <div><div class="zui-metric-label">Remaining</div><div class="zui-metric-value">{remaining:,}</div></div>
-        """
-    metrics_html += "</div>"
-
-    st.markdown(
-        f"""
-        <div class="zui-header">
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;">
-                <div>
-                    <div class="zui-brand">Z UI Studio</div>
-                    {metrics_html}
-                </div>
-                <div id="zui-countdown-{expiry_raw.replace(' ', '').replace(':','')}" style="text-align:right;">
-                    <div class="zui-metric-label">Plan Expiry</div>
-                    <div class="zui-metric-value" id="zui-countdown-value">–</div>
-                    <div class="small-muted" id="zui-expiry-date">–</div>
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if not is_admin and expiry_raw:
-        components.html(
-            f"""
-            <script>
-            const expiry = new Date("{expiry_raw.replace(' ', 'T')}");
-            function fmt(n) {{ return n.toString(); }}
-            function tick() {{
-                const now = new Date();
-                let diff = Math.max(0, (expiry - now) / 1000);
-                const d = Math.floor(diff / 86400);
-                const h = Math.floor((diff % 86400) / 3600);
-                const m = Math.floor((diff % 3600) / 60);
-                const s = Math.floor(diff % 60);
-                const text = d + "d " + h + "h " + m + "m " + s + "s";
-                const parentDoc = window.parent.document;
-                const valueEl = parentDoc.getElementById("zui-countdown-value");
-                const dateEl = parentDoc.getElementById("zui-expiry-date");
-                if (valueEl) valueEl.textContent = text;
-                if (dateEl) {{
-                    const opts = {{ day: '2-digit', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }};
-                    dateEl.textContent = "Expires: " + expiry.toLocaleString('en-GB', opts);
-                }}
-            }}
-            tick();
-            setInterval(tick, 1000);
-            </script>
-            """,
-            height=0,
-        )
+def nav():
+    with st.sidebar:
+        st.markdown(f'<div class="brand" style="font-size:1.35rem">☰ {BRAND}</div>',unsafe_allow_html=True)
+        st.caption(active_username.title())
+        st.divider()
+        for item in valid_pages:
+            label=f'{PAGE_ICONS.get(item,"•")}  {item}'
+            if st.button(label,use_container_width=True,key="nav_"+item,type="primary" if item==page else "secondary"):
+                goto(item)
+        st.divider()
+        if st.button("Logout",use_container_width=True,key="logout_btn"):
+            logout(); st.stop()
 
 
-# ============================================================
-# CLIENT PAGES
-# ============================================================
+def footer():
+    msg=quote(f"Hi, I want to know more about {BRAND}.")
+    st.markdown(f'''<div class="footer"><div class="brand">{BRAND}</div><div class="small">{FOOTER_BY}</div><a class="wa" href="https://wa.me/{WHATSAPP_NUMBER_INTL}?text={msg}" target="_blank">💬 Contact on WhatsApp</a></div>''',unsafe_allow_html=True)
+
+# -------------------- PAGE RENDERERS --------------------
 
 def page_dashboard():
-    render_header()
-    st.markdown(
-        f"""
-        <div class="card">
-            <h2 style="margin-top:0;">Welcome back, {active_username.title()} 👋</h2>
-            <p class="small-muted">Your creative workspace is ready.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    voices = get_saved_voices(active_username)
-    remaining = int(account_profile.get("remaining_chars", 0))
-    total = int(account_profile.get("total_limit", 0))
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Remaining Credits", f"{remaining:,}")
-    col2.metric("Total Credits", f"{total:,}")
-    col3.metric("Saved Voices", len(voices))
-
-    if st.button("🚀 Start Voice Cloning", type="primary", use_container_width=True):
-        set_page_param("Voice Cloning")
-        st.rerun()
-
-    render_footer()
+    header()
+    st.markdown(f'<div class="hero"><h1>Welcome back, {html.escape(active_username.title())}</h1><p class="muted"><span class="status-dot"></span>Your creative workspace is ready.</p></div>',unsafe_allow_html=True)
+    total=int(profile.get("total_credits_allocated",profile.get("total_limit",0))); rem=int(profile.get("remaining_chars",0)); exp=expiry_dt()
+    a,b,c=st.columns(3); a.metric("Total Credits",f"{total:,}"); b.metric("Remaining Credits",f"{rem:,}"); c.metric("Plan Expiry",exp.strftime("%d %b %Y, %I:%M %p"))
+    if st.button("Start Voice Cloning",type="primary",use_container_width=True): goto("Voice Cloning")
+    footer()
 
 
 def page_voice_cloning():
-    render_header()
-    st.markdown("## Voice Cloning")
-    st.caption("Upload a short reference sample and save it under a name you'll recognize.")
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    voice_name = st.text_input("Voice Name", placeholder="e.g. NMAE", max_chars=80, key="voice_name_input")
-    uploaded_voice = st.file_uploader(
-        "Upload Reference Voice",
-        type=["wav", "mp3", "m4a", "ogg", "flac"],
-        key="voice_upload_input",
-    )
-    st.caption("Maximum duration: 12 seconds for better results.")
-
-    if uploaded_voice is not None:
-        st.caption(f"Selected: {uploaded_voice.name} · {uploaded_voice.size / 1024:.1f} KB")
-
-    save_clicked = st.button("💾 Save Voice Clone", type="primary", use_container_width=True,
-                              disabled=st.session_state.get("voice_saving", False))
-
-    if save_clicked:
-        clean_name = voice_name.strip()
-        if not clean_name:
-            st.error("Please enter a voice name.")
-        elif uploaded_voice is None:
-            st.error("Please upload a voice file.")
+    header(); st.markdown("## Voice Cloning"); st.caption("Save a short reference voice under a name you will recognize.")
+    st.markdown('<div class="card">',unsafe_allow_html=True)
+    name=st.text_input("Voice Name",placeholder="e.g. Guru Ji",max_chars=80,key="vc_name")
+    st.caption("Give your saved voice a simple name or label.")
+    up=st.file_uploader("Upload Reference Voice",type=[x.lstrip('.') for x in SUPPORTED_VOICE_EXT],key="vc_upload")
+    st.caption("Maximum duration: 12 seconds for better results • Supported: WAV, MP3, M4A, OGG, FLAC")
+    if up:
+        suffix=Path(up.name).suffix.lower(); dur=uploaded_audio_duration(up)
+        if suffix not in SUPPORTED_VOICE_EXT: st.error("Please upload an audio file in a supported format.")
         else:
-            st.session_state.voice_saving = True
-            progress = st.progress(0)
-            status = st.empty()
-            status.info("Preparing...")
-            progress.progress(30)
-            time.sleep(0.2)
-
-            safe_name = safe_filename(clean_name)
-            extension = Path(uploaded_voice.name).suffix.lower()
-            destination = voice_dir(active_username) / f"{safe_name}{extension}"
-
-            status.info("Uploading...")
-            progress.progress(70)
-            destination.write_bytes(uploaded_voice.getbuffer())
-
-            status.info("Saving...")
-            progress.progress(100)
-            st.session_state.voice_saving = False
-            status.success("Voice saved successfully.")
-            st.success(f'Voice "{clean_name}" saved successfully.')
-            time.sleep(0.4)
-            st.rerun()
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
+            detail=f"{up.name} • {up.size/1024:.1f} KB"
+            if dur is not None: detail+=f" • {dur:.2f}s"
+            st.caption(detail)
+            if dur is not None and dur>MAX_VOICE_SECONDS: st.error("Please upload a voice sample of 12 seconds or less.")
+    saving=st.session_state.get("vc_saving",False)
+    if st.button("Save Voice Clone",type="primary",use_container_width=True,disabled=saving):
+        clean=name.strip()
+        dur=uploaded_audio_duration(up) if up else None
+        if not clean: st.error("Please enter a voice name.")
+        elif not up: st.error("Please upload a voice file.")
+        elif dur is not None and dur>MAX_VOICE_SECONDS: st.error("Please upload a voice sample of 12 seconds or less.")
+        else:
+            st.session_state.vc_saving=True; bar=st.progress(0); msg=st.empty(); msg.info("Preparing..."); bar.progress(15); time.sleep(.12); msg.info("Uploading..."); bar.progress(65); time.sleep(.12)
+            ext=Path(up.name).suffix.lower(); dest=voice_dir(active_username)/(safe_filename(clean)+ext); dest.write_bytes(up.getbuffer()); msg.info("Saving..."); bar.progress(100); st.session_state.vc_saving=False; st.success(f'Voice "{clean}" saved successfully.'); time.sleep(.2); st.rerun()
+    st.markdown('</div>',unsafe_allow_html=True)
     st.markdown("### My Voices")
-    voices = get_saved_voices(active_username)
-
-    if not voices:
-        st.info("You don't have any saved voices yet.")
-    else:
-        for voice in voices:
-            with st.container():
-                st.markdown('<div class="card">', unsafe_allow_html=True)
-                c1, c2, c3 = st.columns([3, 3, 1])
-                c1.markdown(f"**{voice.stem}**")
-                with c2:
-                    st.audio(str(voice))
-                with c3:
-                    confirm_key = f"confirm_delete_{voice.name}"
-                    if st.session_state.get(confirm_key):
-                        st.warning(f'Delete "{voice.stem}"? This cannot be undone.')
-                        cc1, cc2 = st.columns(2)
-                        if cc1.button("Cancel", key=f"cancel_{voice.name}"):
-                            st.session_state[confirm_key] = False
-                            st.rerun()
-                        if cc2.button("Delete", key=f"delete_{voice.name}"):
-                            voice.unlink(missing_ok=True)
-                            st.session_state[confirm_key] = False
-                            st.rerun()
-                    else:
-                        if st.button("🗑️ Delete", key=f"ask_delete_{voice.name}"):
-                            st.session_state[confirm_key] = True
-                            st.rerun()
-                st.markdown("</div>", unsafe_allow_html=True)
-
-    render_footer()
+    vs=saved_voices(active_username)
+    if not vs:
+        st.info("Upload Your First Voice")
+    for v in vs:
+        st.markdown('<div class="card">',unsafe_allow_html=True); a,b=st.columns([4,1]); a.markdown(f"**{html.escape(v.stem)}**"); b1=b.button("Delete",key="del_"+v.name)
+        try: a.audio(v.read_bytes(),format="audio/"+v.suffix.lstrip('.'))
+        except Exception: pass
+        confirm="confirm_"+v.name
+        if b1: st.session_state[confirm]=True
+        if st.session_state.get(confirm):
+            st.warning(f'Delete "{v.stem}"? This voice sample will be permanently removed.')
+            c1,c2=st.columns(2)
+            if c1.button("Cancel",key="cancel_"+v.name): st.session_state[confirm]=False; st.rerun()
+            if c2.button("Delete",key="confirm_"+v.name): v.unlink(missing_ok=True); st.session_state[confirm]=False; st.rerun()
+        st.markdown('</div>',unsafe_allow_html=True)
+    footer()
 
 
-def page_text_to_speech():
-    render_header()
-    st.markdown("## Turn Your Text Into Speech")
-    st.caption("Transform your text into natural, expressive speech using your selected voice.")
+def process_completed_jobs():
+    jobs=all_jobs(active_username); completed=[j for j in jobs if j.get("type")=="tts" and j.get("status")=="completed"]
+    for job in completed:
+        if not job.get("credits_charged"):
+            if not charge_once(user_db,profile,active_username,job["job_id"],job.get("chars",0)):
+                update_job(active_username,job["job_id"],status="failed",error="Your credits could not be updated. Please contact support."); continue
+        if not job.get("history_recorded") and job.get("result_file") and Path(job["result_file"]).exists():
+            add_history(active_username,{"job_id":job["job_id"],"title":job.get("title","Untitled"),"voice_name":job.get("voice_name",""),"audio_path":job["result_file"],"generated_at":datetime.now().isoformat()})
+            update_job(active_username,job["job_id"],history_recorded=True)
 
-    voices = get_saved_voices(active_username)
-    if not voices:
+
+def result_card(job):
+    result=Path(job.get("result_file", ""))
+    if not result.exists(): return
+    st.markdown('<div class="card">',unsafe_allow_html=True); st.success("Speech generated successfully."); st.markdown(f"### {html.escape(job.get('title','Untitled'))}"); st.caption(f"Voice: {html.escape(job.get('voice_name',''))}")
+    audio=result.read_bytes(); st.audio(audio,format="audio/wav")
+    a,b=st.columns(2); a.download_button("Download",audio,file_name=f'{safe_filename(job.get("title","audio"))}.wav',mime="audio/wav",use_container_width=True,key="download_"+job["job_id"])
+    token=create_share(active_username,job["job_id"])
+    if token:
+        # Build a share link using the current app URL while keeping credentials out of it.
+        try: base=st.context.url
+        except Exception: base=""
+        if base:
+            share_url=base.split("?")[0]+"?share="+token
+            if b.button("Share",use_container_width=True,key="share_"+job["job_id"]): st.session_state["share_url"]=share_url
+        if st.session_state.get("share_url"):
+            st.text_input("Shareable link",value=st.session_state["share_url"],key="share_link_display")
+            st.caption("Share links expire after 7 days.")
+    st.markdown('</div>',unsafe_allow_html=True)
+
+
+def page_tts():
+    header(); st.markdown("## Turn Your Text Into Speech"); st.caption("Transform your text into natural, expressive speech using your selected voice.")
+    vs=saved_voices(active_username)
+    if not vs:
         st.warning("No saved voice found. Add one in Voice Cloning first.")
-        if st.button("🎙️ Open Voice Cloning"):
-            set_page_param("Voice Cloning")
-            st.rerun()
-        render_footer()
-        return
-
-    active_job = get_active_job(active_username, job_type="tts")
-
-    voice_names = [v.stem for v in voices]
-    default_index = 0
-    if active_job and active_job.get("voice_name") in voice_names:
-        default_index = voice_names.index(active_job["voice_name"])
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-
-    selected_voice = st.selectbox("Select Your Voice", voice_names, index=default_index,
-                                   disabled=bool(active_job))
-    selected_path = next(p for p in voices if p.stem == selected_voice)
-
-    default_text = active_job.get("text", "") if active_job else st.session_state.get("tts_text_draft", "")
-    text_input = st.text_area(
-        "Enter Your Text", value=default_text, height=260,
-        placeholder="Type your text here...", disabled=bool(active_job), key="tts_text_area",
-    )
-    if not active_job:
-        st.session_state.tts_text_draft = text_input
-
-    current_count = character_count(text_input)
-    remaining = int(account_profile.get("remaining_chars", 0))
-
-    c1, c2 = st.columns(2)
-    c1.metric("Characters in this script", f"{current_count:,}")
-    c2.metric("Remaining after generation", f"{max(remaining - current_count, 0):,}")
-
-    if current_count > remaining and not active_job:
-        st.error("Not enough credits for this script.")
-
-    default_title = active_job.get("title", "") if active_job else st.session_state.get("tts_title_draft", "")
-    audio_title = st.text_input("Audio Title", value=default_title, placeholder="Technology",
-                                 disabled=bool(active_job), key="tts_title_input")
-    if not active_job:
-        st.session_state.tts_title_draft = audio_title
-
-    generate_disabled = bool(active_job) or current_count == 0 or current_count > remaining
-    generate_clicked = st.button("⚡ Generate Speech", type="primary", use_container_width=True,
-                                  disabled=generate_disabled)
-
-    if generate_clicked and not active_job:
-        gen_username = str(account_profile.get("kaggle_username", "")).strip()
-        gen_token = str(account_profile.get("kaggle_token", "")).strip()
-        if not gen_username or not gen_token:
-            st.error("Please connect your account in Settings before generating.")
+        if st.button("Open Voice Cloning",use_container_width=True): goto("Voice Cloning")
+        footer(); return
+    active=active_job(active_username,"tts")
+    names=[v.stem for v in vs]; active_voice=active.get("voice_name") if active else st.session_state.get("tts_voice",names[0]); idx=names.index(active_voice) if active_voice in names else 0
+    st.markdown('<div class="card">',unsafe_allow_html=True)
+    voice=st.selectbox("Select Your Voice",names,index=idx,disabled=bool(active)); selected=next(v for v in vs if v.stem==voice)
+    text_default=active.get("text","") if active else st.session_state.get("tts_text","")
+    text=st.text_area("Enter Your Text",value=text_default,height=260,placeholder="Type your text here...",disabled=bool(active),key="tts_text_area")
+    if not active: st.session_state.tts_text=text; st.session_state.tts_voice=voice
+    count=len(text); rem=int(profile.get("remaining_chars",0)); a,b=st.columns(2); a.metric("Characters in this script",f"{count:,}"); b.metric("Remaining after generation",f"{max(rem-count,0):,}")
+    title_default=active.get("title","") if active else st.session_state.get("tts_title","")
+    title=st.text_input("Audio Title",value=title_default,placeholder="Technology",disabled=bool(active),key="tts_title_input")
+    if not active: st.session_state.tts_title=title
+    if count>rem and not active: st.error("Not enough credits for this script.")
+    clicked=st.button("Generate Speech",type="primary",use_container_width=True,disabled=bool(active) or count==0 or count>rem)
+    if clicked and not active:
+        gen_user=str(profile.get("kaggle_username","")).strip(); gen_token=str(profile.get("kaggle_token","")).strip()
+        if not gen_user or not gen_token: st.error("Please connect your generation account in Settings before generating.")
         else:
-            title_snapshot = audio_title.strip() or "Untitled"
-            start_generation_job(
-                active_username, text_input, title_snapshot, selected_path,
-                gen_username, gen_token, current_count,
-            )
-            st.rerun()
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # ---- live job status / polling ----
-    active_job = get_active_job(active_username, job_type="tts")
-    if active_job:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        pct = float(active_job.get("progress", 0))
-        st.progress(int(max(0, min(100, pct))))
-        st.markdown(f"**{pct:.1f}%** — {active_job.get('message', '')}")
-        st.caption("You can safely refresh this page — generation will continue.")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        if active_job.get("status") == "failed":
-            st.error(active_job.get("error") or "Generation failed. Please try again.")
-            clear_active_job(active_username, active_job["job_id"])
-            st.session_state.pop("tts_text_draft", None)
-            st.session_state.pop("tts_title_draft", None)
-            if st.button("Try Again"):
-                st.rerun()
-        else:
-            time.sleep(1.2)
-            st.rerun()
-
-    # ---- most recent completed result (if just finished) ----
-    last_job_id = st.session_state.get("last_shown_job")
-    jobs = load_json(jobs_file(active_username), {})
-    completed_jobs = [j for j in jobs.values() if j.get("status") == "completed"]
-    completed_jobs.sort(key=lambda j: j.get("updated", ""), reverse=True)
-
-    if completed_jobs:
-        latest = completed_jobs[0]
-        if latest["job_id"] != last_job_id:
-            # charge credits exactly once, record history
-            if not latest.get("credits_charged"):
-                charge_credits_once(user_db, account_profile, active_username, latest["job_id"], latest.get("chars", 0))
-            if not latest.get("history_recorded"):
-                result_file = latest.get("result_file")
-                if result_file and Path(result_file).exists():
-                    add_history_entry(active_username, {
-                        "title": latest.get("title", "Untitled"),
-                        "voice_name": latest.get("voice_name", ""),
-                        "audio_path": result_file,
-                        "generated_at": datetime.now().isoformat(),
-                    })
-                update_job(active_username, latest["job_id"], history_recorded=True)
-            clear_active_job(active_username, latest["job_id"])
-            st.session_state.last_shown_job = latest["job_id"]
-            st.session_state.pop("tts_text_draft", None)
-            st.session_state.pop("tts_title_draft", None)
-
-        result_file = latest.get("result_file")
-        if result_file and Path(result_file).exists() and latest["job_id"] == last_job_id:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.success("Speech generated successfully.")
-            st.markdown(f"**{latest.get('title', 'Untitled')}**")
-            st.caption(f"Voice: {latest.get('voice_name', '')}")
-            audio_bytes = Path(result_file).read_bytes()
-            st.audio(audio_bytes, format="audio/wav")
-            fname = f"{safe_filename(latest.get('title', 'audio'))}.wav"
-            st.download_button("⬇️ Download", data=audio_bytes, file_name=fname, mime="audio/wav")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    render_footer()
+            snapshot_title=title.strip() or "Untitled"; start_generation(active_username,text,snapshot_title,selected,gen_user,gen_token,count); st.rerun()
+    st.markdown('</div>',unsafe_allow_html=True)
+    if active:
+        pct=float(active.get("progress",0)); st.markdown('<div class="card">',unsafe_allow_html=True); st.progress(int(pct)); st.markdown(f"**{pct:.1f}%** — {html.escape(active.get('message','Generating your speech...'))}"); st.caption("You can safely refresh this page. Your generation will continue."); st.markdown('</div>',unsafe_allow_html=True)
+        if active.get("status")=="failed": st.error(active.get("error") or "Generation failed. Please try again.")
+        else: time.sleep(1.2); st.rerun()
+    process_completed_jobs()
+    jobs=[j for j in all_jobs(active_username) if j.get("type")=="tts" and j.get("status")=="completed" and j.get("result_file")]
+    if jobs:
+        latest=max(jobs,key=lambda x:x.get("updated",x.get("created","")))
+        result_card(latest)
+    footer()
 
 
 def page_history():
-    render_header(show_credits=False)
-    items = get_history(active_username)
-    items.sort(key=lambda x: x["generated_at"], reverse=True)
-
-    oldest = items[-1]["generated_at"][:10] if items else datetime.now().strftime("%Y-%m-%d")
-    newest = items[0]["generated_at"][:10] if items else datetime.now().strftime("%Y-%m-%d")
-
-    st.markdown(
-        f"""
-        <div class="zui-header">
-            <div class="zui-metric-row">
-                <div><div class="zui-metric-label">Total Voices Generated</div>
-                     <div class="zui-metric-value">{len(items)}</div></div>
-                <div><div class="zui-metric-label">Available History</div>
-                     <div class="zui-metric-value">{oldest} – {newest}</div></div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    filter_choice = st.radio("Filter", ["Yesterday", "2 Days", "7 Days"], index=2, horizontal=True)
-    now = datetime.now()
-    if filter_choice == "Yesterday":
-        cutoff = now - timedelta(days=1)
-    elif filter_choice == "2 Days":
-        cutoff = now - timedelta(days=2)
+    header(); items=prune_history(active_username); items.sort(key=lambda x:x.get("generated_at",""),reverse=True)
+    choice=st.radio("Filter",["Yesterday","2 Days","7 Days"],index=2,horizontal=True); days={"Yesterday":1,"2 Days":2,"7 Days":7}[choice]; cutoff=datetime.now()-timedelta(days=days); filtered=[]
+    for x in items:
+        try:
+            if datetime.fromisoformat(x["generated_at"])>=cutoff: filtered.append(x)
+        except Exception: pass
+    st.markdown('<div class="zui-history-scroll">',unsafe_allow_html=True)
+    if not filtered: st.info("No history in this range.")
     else:
-        cutoff = now - timedelta(days=7)
-
-    filtered = [i for i in items if datetime.fromisoformat(i["generated_at"]) >= cutoff]
-
-    st.markdown('<div class="zui-history-scroll">', unsafe_allow_html=True)
-    if not filtered:
-        st.info("No history in this range.")
-    else:
-        current_heading = None
+        current=None; now=datetime.now()
         for item in filtered:
-            ts = datetime.fromisoformat(item["generated_at"])
-            if ts.date() == now.date():
-                heading = "Today"
-            elif ts.date() == (now - timedelta(days=1)).date():
-                heading = "Yesterday"
-            else:
-                heading = ts.strftime("%d %b %Y")
-
-            if heading != current_heading:
-                st.markdown(f"#### {heading}")
-                current_heading = heading
-
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown(f"**{item['title']}**")
-            st.caption(f"Voice: {item['voice_name']} · Generated: {ts.strftime('%d %b %Y • %I:%M %p')}")
-            audio_path = Path(item["audio_path"])
-            if audio_path.exists():
-                audio_bytes = audio_path.read_bytes()
-                st.audio(audio_bytes, format="audio/wav")
-                fname = f"{safe_filename(item['title'])}.wav"
-                st.download_button("⬇️ Download", data=audio_bytes, file_name=fname,
-                                    key=f"dl_{item['generated_at']}")
-            else:
-                st.caption("This audio is no longer available.")
-            st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    render_footer()
+            ts=datetime.fromisoformat(item["generated_at"]); heading="Today" if ts.date()==now.date() else ("Yesterday" if ts.date()==(now-timedelta(days=1)).date() else ts.strftime("%d %b %Y"))
+            if heading!=current: st.markdown(f"#### {heading}"); current=heading
+            st.markdown('<div class="card">',unsafe_allow_html=True); st.markdown(f"**{html.escape(item.get('title','Untitled'))}**"); st.caption(f"Voice: {html.escape(item.get('voice_name',''))} • Generated: {ts.strftime('%d %b %Y • %I:%M %p')}")
+            audio=Path(item.get("audio_path",""))
+            if audio.exists():
+                data=audio.read_bytes(); st.audio(data,format="audio/wav"); a,b=st.columns(2); a.download_button("Download",data,file_name=f'{safe_filename(item.get("title","audio"))}.wav',mime="audio/wav",key="hist_dl_"+item.get("job_id",uuid.uuid4().hex));
+                token=create_share(active_username,item.get("job_id")) if item.get("job_id") else None
+                if token:
+                    try: base=st.context.url; url=base.split("?")[0]+"?share="+token
+                    except Exception: url=""
+                    if url and b.button("Share",key="hist_share_"+item.get("job_id",uuid.uuid4().hex)): st.session_state["history_share_url"]=url
+                    if st.session_state.get("history_share_url"): st.text_input("Shareable link",value=st.session_state["history_share_url"],key="hist_share_url")
+            else: st.caption("This audio is no longer available.")
+            st.markdown('</div>',unsafe_allow_html=True)
+    st.markdown('</div>',unsafe_allow_html=True); footer()
 
 
 def page_settings():
-    render_header()
-    st.markdown("## Settings")
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("#### Generation Connection")
-    st.caption("Connect the account used to power your generations.")
-
-    saved_username = account_profile.get("kaggle_username", "")
-    saved_token = account_profile.get("kaggle_token", "")
-
-    show_token = st.checkbox("Show token", value=False, key="show_gen_token")
-    with st.form("gen_connection_form"):
-        gen_username = st.text_input("Username", value=saved_username)
-        gen_token = st.text_input("API Token", value=saved_token,
-                                   type="default" if show_token else "password")
-        col1, col2, col3 = st.columns(3)
-        save_clicked = col1.form_submit_button("Save Credentials", use_container_width=True)
-        verify_clicked = col2.form_submit_button("Verify Credentials", use_container_width=True)
-        remove_clicked = col3.form_submit_button("Remove Credentials", use_container_width=True)
-
-    if save_clicked:
-        if not gen_username.strip() or not gen_token.strip():
-            st.error("✕ Unable to save credentials. Please check your details and try again.")
-        elif save_generation_credentials(user_db, account_profile, gen_username, gen_token):
-            st.success("✓ Credentials saved successfully.")
-            st.rerun()
-
-    if verify_clicked:
-        with st.spinner("Verifying..."):
-            username_ok, token_ok, err = verify_generation_credentials(gen_username.strip(), gen_token.strip())
-        if err:
-            st.warning(err)
+    header(); st.markdown("## Settings"); st.markdown('<div class="card">',unsafe_allow_html=True); st.markdown("### Generation Connection"); st.caption("Connect the account used to power your generations.")
+    saved_u=profile.get("kaggle_username",""); saved_t=profile.get("kaggle_token","")
+    show=st.checkbox("Show token",value=st.session_state.get("show_token",False)); st.session_state.show_token=show
+    with st.form("connection_form"):
+        u=st.text_input("Username",value=saved_u); t=st.text_input("API Token",value=saved_t,type="default" if show else "password"); a,b,c=st.columns(3); save=a.form_submit_button("Save Credentials",use_container_width=True); verify=b.form_submit_button("Verify Credentials",use_container_width=True); remove=c.form_submit_button("Remove Credentials",use_container_width=True)
+    if save:
+        if not u.strip() or not t.strip(): st.error("✕ Unable to save credentials. Please check your details and try again.")
+        elif (profile.update({"kaggle_username":u.strip(),"kaggle_token":t.strip()}) or True) and push_database_updates(user_db): st.success("✓ Credentials saved successfully.")
+        else: st.error("✕ Unable to save credentials. Please check your details and try again.")
+    if verify:
+        with st.spinner("Verifying..."): uok,tok,err=verify_generation_credentials(u.strip(),t.strip())
+        if err: st.warning(err)
         else:
-            st.write("✓ Username — Valid" if username_ok else "✕ Username — Invalid")
-            st.write("✓ API Token — Valid" if token_ok else "✕ API Token — Invalid")
-            if username_ok and token_ok:
-                st.success("Credentials verified successfully.")
-
-    if remove_clicked:
-        st.session_state.confirm_remove_gen = True
-
-    if st.session_state.get("confirm_remove_gen"):
-        st.warning("Remove your saved credentials? You will need to enter them again before using voice generation.")
-        cc1, cc2 = st.columns(2)
-        if cc1.button("Cancel", key="cancel_remove_gen"):
-            st.session_state.confirm_remove_gen = False
-            st.rerun()
-        if cc2.button("Remove", key="confirm_remove_gen_btn"):
-            if remove_generation_credentials(user_db, account_profile):
-                st.session_state.confirm_remove_gen = False
-                st.success("✓ Credentials removed successfully.")
-                st.rerun()
-
-    st.markdown("</div>", unsafe_allow_html=True)
-    render_footer()
+            st.write("✓ Username — Valid" if uok else "✕ Username — Invalid"); st.write("✓ API Token — Valid" if tok else "✕ API Token — Invalid")
+            if uok and tok: st.success("Credentials verified successfully.")
+    if remove: st.session_state.confirm_remove=True
+    if st.session_state.get("confirm_remove"):
+        st.warning("Remove your saved credentials? You will need to enter them again before using voice generation."); a,b=st.columns(2)
+        if a.button("Cancel",key="cancel_remove"): st.session_state.confirm_remove=False; st.rerun()
+        if b.button("Remove",key="remove_confirm"): profile["kaggle_username"]=""; profile["kaggle_token"]=""; ok=push_database_updates(user_db); st.session_state.confirm_remove=False; st.success("✓ Credentials removed successfully.") if ok else st.error("Unable to remove credentials."); st.rerun()
+    st.markdown('</div>',unsafe_allow_html=True); footer()
 
 
 def page_account():
-    render_header()
-    st.markdown("## Account")
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("#### Account Overview")
-    c1, c2 = st.columns(2)
-    c1.metric("Username", active_username)
-    c1.metric("Total Credits", f"{int(account_profile.get('total_limit', 0)):,}")
-    c2.metric("Account Status", "Revoked" if account_profile.get("is_revoked") else "Active")
-    c2.metric("Remaining Credits", f"{int(account_profile.get('remaining_chars', 0)):,}")
-    st.caption(f"Expires: {account_profile.get('expiry_timestamp', '—')}")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("#### Change Password")
-    with st.form("change_password_form"):
-        current_pw = st.text_input("Current Password", type="password")
-        new_pw = st.text_input("New Password", type="password")
-        change_clicked = st.form_submit_button("Change Password", use_container_width=True)
-
-    if change_clicked:
-        if account_profile.get("password") != current_pw:
-            st.error("Current password is incorrect.")
-        elif not new_pw:
-            st.error("Please enter a new password.")
-        else:
-            account_profile["password"] = new_pw
-            if push_database_updates(user_db):
-                st.success("Password changed successfully.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("#### Where Your Account Is Connected")
-    sessions = list_sessions_for_user(active_username)
-    current_sid = st.session_state.get("session_id")
-    if not sessions:
-        st.info("No active sessions found.")
-    for s in sessions:
-        is_current = s["sid"] == current_sid
-        st.markdown(
-            f"""
-            <div class="card" style="margin-bottom:10px;">
-                <div><strong>{"This device" if is_current else "Other device"}</strong></div>
-                <div class="small-muted">Signed in: {s.get('created', '—')}</div>
-                <div class="small-muted">Last active: {s.get('last_seen', '—')}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    header(); st.markdown("## Account")
+    st.markdown('<div class="card">',unsafe_allow_html=True); st.markdown("### Account Overview"); a,b=st.columns(2); a.metric("Username",active_username); a.metric("Total Credits",f'{int(profile.get("total_credits_allocated",profile.get("total_limit",0))):,}'); b.metric("Account Status","Active"); b.metric("Remaining Credits",f'{int(profile.get("remaining_chars",0)):,}'); st.caption(f'Expires: {expiry_dt().strftime("%d %b %Y, %I:%M %p")}'); st.markdown('</div>',unsafe_allow_html=True)
+    st.markdown('<div class="card">',unsafe_allow_html=True); st.markdown("### Change Password")
+    with st.form("change_password"):
+        old=st.text_input("Current Password",type="password"); new=st.text_input("New Password",type="password"); change=st.form_submit_button("Change Password",use_container_width=True)
+    if change:
+        if profile.get("password")!=old: st.error("Current password is incorrect.")
+        elif not new: st.error("Please enter a new password.")
+        else: profile["password"]=new; st.success("Password changed successfully.") if push_database_updates(user_db) else st.error("Unable to change password right now.")
+    st.markdown('</div>',unsafe_allow_html=True)
+    st.markdown('<div class="card">',unsafe_allow_html=True); st.markdown("### Where Your Account Is Connected")
+    current=st.session_state.get("session_id")
+    for s in sessions_for_user(active_username):
+        is_current=s["sid"]==current; ua=html.escape(s.get("user_agent","Unknown browser")); ip=html.escape(s.get("ip","Unavailable")); last=s.get("last_seen","—")
+        st.markdown(f'<div class="card"><strong>{"This device" if is_current else "Other device"}</strong><div class="small">Browser / OS: {ua}</div><div class="small">IP: {ip}</div><div class="small">Last active: {html.escape(last)}</div></div>',unsafe_allow_html=True)
         if not is_current:
-            confirm_key = f"confirm_remove_{s['sid']}"
-            if st.session_state.get(confirm_key):
-                st.warning("Remove access from this device? This device will be logged out and its current session will no longer be valid.")
-                cc1, cc2 = st.columns(2)
-                if cc1.button("Cancel", key=f"cancel_dev_{s['sid']}"):
-                    st.session_state[confirm_key] = False
-                    st.rerun()
-                if cc2.button("Remove Access", key=f"remove_dev_{s['sid']}"):
-                    remove_session(s["sid"])
-                    st.session_state[confirm_key] = False
-                    st.rerun()
-            else:
-                if st.button("Remove Access", key=f"ask_remove_dev_{s['sid']}"):
-                    st.session_state[confirm_key] = True
-                    st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+            key="remove_device_"+s["sid"]
+            if st.button("Remove Access",key=key): st.session_state["confirm_device"]=s["sid"]
+            if st.session_state.get("confirm_device")==s["sid"]:
+                st.warning("Remove access from this device? This device will be logged out and its current session will no longer be valid."); a,b=st.columns(2)
+                if a.button("Cancel",key="cancel_dev_"+s["sid"]): st.session_state.pop("confirm_device",None); st.rerun()
+                if b.button("Remove Access",key="confirm_dev_"+s["sid"]): remove_session(s["sid"]); st.session_state.pop("confirm_device",None); st.rerun()
+    st.markdown('</div>',unsafe_allow_html=True); footer()
 
-    render_footer()
+# -------------------- ADMIN --------------------
+
+def admin_dashboard():
+    header(); st.markdown(f"## Welcome, {html.escape(active_username.title())}"); st.caption("Administrator workspace")
+    regular=[x for x in user_db.values() if not x.get("is_admin",False)]; active=sum(1 for x in regular if not x.get("is_revoked",False)); a,b=st.columns(2); a.metric("Total Clients",len(regular)); b.metric("Active Clients",active); footer()
 
 
-# ============================================================
-# ADMIN PAGES
-# ============================================================
-
-def page_admin_dashboard():
-    render_header(show_credits=False)
-    st.markdown(f"## Welcome, {active_username.title()} 👑")
-    st.info("Master Administrator")
-    regular_users = [u for u in user_db.values() if not u.get("is_admin", False)]
-    active_count = sum(1 for u in regular_users if not u.get("is_revoked", False))
-    col1, col2 = st.columns(2)
-    col1.metric("Total Clients", len(regular_users))
-    col2.metric("Active Clients", active_count)
-    render_footer()
-
-
-def page_admin_registry():
-    render_header(show_credits=False)
-    st.markdown("## Active Users Registry")
-
-    regular_users = [(name, info) for name, info in user_db.items() if not info.get("is_admin", False)]
-    if not regular_users:
-        st.info("No regular users are registered.")
-
-    for u_name, u_info in regular_users:
-        with st.expander(f"{u_name} — {'🔴 Revoked' if u_info.get('is_revoked') else '🟢 Active'}"):
-            new_limit = st.number_input("Remaining Characters", min_value=0,
-                                         value=int(u_info.get("remaining_chars", 0)), key=f"limit_{u_name}")
-            add_days = st.number_input("Extend Plan Days", min_value=0, value=0, key=f"days_{u_name}")
-
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("🔴 Revoke / 🟢 Grant", key=f"toggle_{u_name}", use_container_width=True):
-                    u_info["is_revoked"] = not u_info.get("is_revoked", False)
-                    if push_database_updates(user_db):
-                        st.rerun()
-            with col2:
-                if st.button("💾 Save Changes", key=f"save_{u_name}", use_container_width=True):
-                    u_info["remaining_chars"] = int(new_limit)
-                    if add_days > 0:
-                        try:
-                            curr_exp = datetime.strptime(u_info["expiry_timestamp"], "%Y-%m-%d %H:%M:%S")
-                        except Exception:
-                            curr_exp = datetime.now()
-                        if curr_exp < datetime.now():
-                            curr_exp = datetime.now()
-                        u_info["expiry_timestamp"] = (curr_exp + timedelta(days=int(add_days))).strftime("%Y-%m-%d %H:%M:%S")
-                    if push_database_updates(user_db):
-                        st.rerun()
-    render_footer()
+def admin_registry():
+    header(); st.markdown("## Active Users Registry")
+    for n,x in [(n,x) for n,x in user_db.items() if not x.get("is_admin",False)]:
+        with st.expander(f'{n} — {"Revoked" if x.get("is_revoked") else "Active"}'):
+            current=int(x.get("remaining_chars",0)); add=st.number_input("Add Credits",min_value=0,value=0,key="add_"+n); new_exp_days=st.number_input("Extend Plan Days",min_value=0,value=0,key="days_"+n)
+            st.caption(f'Current remaining: {current:,} • Cumulative allocated: {int(x.get("total_credits_allocated",x.get("total_limit",0))):,}')
+            a,b=st.columns(2)
+            if a.button("Revoke / Grant",key="toggle_"+n,use_container_width=True): x["is_revoked"]=not x.get("is_revoked",False); push_database_updates(user_db); st.rerun()
+            if b.button("Save Changes",key="save_"+n,use_container_width=True):
+                if add: x["remaining_chars"]=current+int(add); x["total_credits_allocated"]=int(x.get("total_credits_allocated",x.get("total_limit",0)))+int(add); x["total_limit"]=x["total_credits_allocated"]
+                if new_exp_days:
+                    e=expiry_dt() if n==active_username else datetime.strptime(x["expiry_timestamp"],"%Y-%m-%d %H:%M:%S"); x["expiry_timestamp"]=(max(e,datetime.now())+timedelta(days=int(new_exp_days))).strftime("%Y-%m-%d %H:%M:%S")
+                if push_database_updates(user_db): st.rerun()
+    footer()
 
 
-def page_admin_deploy():
-    render_header(show_credits=False)
-    st.markdown("## Deploy New Client")
-
-    with st.form("new_user_registration_form"):
-        reg_user = st.text_input("New Client Username").upper().strip()
-        reg_pass = st.text_input("Set Login Password", type="password")
-        reg_days = st.number_input("Plan Duration (Days)", min_value=1, value=30)
-        reg_chars = st.number_input("Character Allocation", min_value=1000, value=1000000)
-        create_user = st.form_submit_button("🚀 Deploy User", use_container_width=True)
-
-        if create_user:
-            if not reg_user or not reg_pass:
-                st.error("Username and password are required.")
-            elif reg_user in user_db:
-                st.error("That username already exists.")
-            else:
-                expiry = (datetime.now() + timedelta(days=int(reg_days))).strftime("%Y-%m-%d %H:%M:%S")
-                user_db[reg_user] = {
-                    "password": reg_pass, "expiry_timestamp": expiry,
-                    "total_limit": int(reg_chars), "remaining_chars": int(reg_chars),
-                    "is_revoked": False, "is_admin": False,
-                    "kaggle_username": "", "kaggle_token": "",
-                }
-                if push_database_updates(user_db):
-                    st.success(f"User {reg_user} created successfully.")
-                    st.rerun()
-    render_footer()
+def admin_deploy():
+    header(); st.markdown("## Deploy New Client")
+    with st.form("deploy_form"):
+        u=st.text_input("New Client Username").upper().strip(); pw=st.text_input("Set Login Password",type="password"); days=st.number_input("Plan Duration (Days)",min_value=1,value=30); chars=st.number_input("Character Allocation",min_value=1000,value=1000000); go=st.form_submit_button("Deploy User",type="primary",use_container_width=True)
+    if go:
+        if not u or not pw: st.error("Username and password are required.")
+        elif u in user_db: st.error("That username already exists.")
+        else:
+            amount=int(chars); user_db[u]={"password":pw,"expiry_timestamp":(datetime.now()+timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S"),"total_limit":amount,"total_credits_allocated":amount,"remaining_chars":amount,"is_revoked":False,"is_admin":False,"kaggle_username":"","kaggle_token":""}
+            if push_database_updates(user_db): st.success(f"User {u} created successfully."); st.rerun()
+            else: st.error("We couldn't create the account right now.")
+    footer()
 
 
-def page_admin_settings():
-    render_header(show_credits=False)
-    st.markdown("## Administrator Settings")
-    st.info("Core storage configuration is managed outside this interface.")
-    render_footer()
+def admin_settings():
+    header(); st.markdown("## Settings"); st.info("Core storage configuration is managed securely outside this interface."); footer()
 
-
-# ============================================================
-# ROUTER
-# ============================================================
-
+# -------------------- ROUTER --------------------
+nav();
 if is_admin:
-    router = {
-        "Dashboard": page_admin_dashboard,
-        "Active Users Registry": page_admin_registry,
-        "Deploy New Client": page_admin_deploy,
-        "Settings": page_admin_settings,
-    }
+    routes={"Dashboard":admin_dashboard,"Active Users Registry":admin_registry,"Deploy New Client":admin_deploy,"Settings":admin_settings}
 else:
-    router = {
-        "Dashboard": page_dashboard,
-        "Voice Cloning": page_voice_cloning,
-        "Text To Speech": page_text_to_speech,
-        "History": page_history,
-        "Settings": page_settings,
-        "Account": page_account,
-    }
+    routes={"Dashboard":page_dashboard,"Voice Cloning":page_voice_cloning,"Text To Speech":page_tts,"History":page_history,"Settings":page_settings,"Account":page_account}
 
-router.get(page, router[valid_pages[0]])()
+routes.get(page,routes[valid_pages[0]])()
