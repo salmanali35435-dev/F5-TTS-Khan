@@ -6,7 +6,8 @@
       "total_limit": 99999999,
       "remaining_chars": 99999999,
       "is_revoked": false,
-      "is_admin": true
+      "is_admin": true,
+      "total_credits_allocated": 99999999
     },
     "USAMA": {
       "password": "Usama@3298",
@@ -23,7 +24,7 @@
       "expiry_timestamp": "2026-09-27 12:40:21",
       "total_limit": 1000,
       "remaining_chars": 96192,
-      "is_revoked": false,
+      "is_revoked": true,
       "is_admin": false,
       "kaggle_username": "pknetwork",
       "kaggle_token": "KGAT_8d3b2de80c15b58f127de16bb773f985"
