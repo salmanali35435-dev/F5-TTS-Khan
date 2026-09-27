@@ -663,6 +663,9 @@ def _poll_for_ready(username, job_id, kernel_ref, env, report, enforce_queue_tim
                     report(status="disconnected", message=payload.get("message", "Disconnected"), logs=logs)
                     return False
                 report(status="installing", message=payload.get("message", "Installing..."), progress=min(90, 15 + len(logs) * 6), logs=logs)
+            elif enforce_queue_timeout and k_status == "queued":
+                queue_msg = "Kaggle Cloud Scheduler: Notebook is currently Queued on servers (Chup hai / waiting for free GPU cluster)..."
+                report(status="installing", message=queue_msg, progress=10, logs=[queue_msg])
         except Exception:
             pass
         finally:
@@ -688,7 +691,6 @@ def run_connect_job(username, job_id, gen_username, gen_token):
         # brand-new one (same deterministic kernel id per user => this never
         # creates or affects any other notebook on the account).
         if kaggle_kernel_status(kernel_ref, env) == "running":
-            report(status="installing", message="Reusing your existing server session...", progress=40)
             if _poll_for_ready(username, job_id, kernel_ref, env, report, enforce_queue_timeout=False):
                 return
 
