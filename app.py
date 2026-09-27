@@ -621,7 +621,7 @@ def login_page():
             except Exception: exp=datetime.now()+timedelta(days=1)
             if exp<datetime.now() and not target.get("is_admin",False): st.error("Your plan has expired. Please contact support to renew.")
             else:
-                sid=create_session(username); st.session_state.auth_session=True; st.session_state.current_user=username; st.session_state.session_id=sid; st.session_state.page="Dashboard"; set_cookie(sid); st.stop()
+                sid=create_session(username); st.session_state.auth_session=True; st.session_state.current_user=username; st.session_state.session_id=sid; st.session_state.page="Dashboard"; st.query_params["page"]="Dashboard"; st.rerun()
     st.markdown('</div>',unsafe_allow_html=True)
     msg=quote(f"Hi {ADMIN_CONTACT_NAME}, I want to request access to {BRAND}.")
     st.markdown(f'''<div class="card" style="text-align:center"><div style="font-weight:800">Need access?</div><div class="small">{ADMIN_CONTACT_NAME}</div><a class="wa" href="https://wa.me/{WHATSAPP_NUMBER_INTL}?text={msg}" target="_blank">💬 Contact on WhatsApp</a></div></div>''',unsafe_allow_html=True)
