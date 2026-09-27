@@ -13,7 +13,7 @@
       "password": "Usama@3298",
       "expiry_timestamp": "2026-10-29 11:52:05",
       "total_limit": 10000,
-      "remaining_chars": 1000000,
+      "remaining_chars": 999986,
       "is_revoked": false,
       "is_admin": false,
       "kaggle_username": "mfazil761",
@@ -21,14 +21,13 @@
     },
     "RAZA": {
       "password": "Raza123",
-      "expiry_timestamp": "2300-07-13 12:55:16",
+      "expiry_timestamp": "2026-09-27 12:40:21",
       "total_limit": 1000,
-      "remaining_chars": 96193,
+      "remaining_chars": 96192,
       "is_revoked": false,
       "is_admin": false,
       "kaggle_username": "pknetwork",
-      "kaggle_token": "KGAT_8d3b2de80c15b58f127de16bb773f985",
-      "total_credits_allocated": 1001
+      "kaggle_token": "KGAT_8d3b2de80c15b58f127de16bb773f985"
     }
   }
 }
