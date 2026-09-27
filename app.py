@@ -505,6 +505,51 @@ def verify_generation_credentials(username, token):
         return False, False, "Could not verify right now. Please try again."
 
 
+QUEUE_TIMEOUT_SECONDS = 300  # 5 minutes stuck in Kaggle's "queued" state
+
+
+def kaggle_kernel_status(kernel_ref, env):
+    try:
+        r = subprocess.run(["kaggle", "kernels", "status", kernel_ref], env=env, capture_output=True, text=True, timeout=20, check=False)
+        low = ((r.stdout or "") + (r.stderr or "")).lower()
+        if "queued" in low:
+            return "queued"
+        if "running" in low:
+            return "running"
+        if "complete" in low:
+            return "complete"
+        if "error" in low or "cancel" in low:
+            return "error"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _cleanup_stuck_kernel(kernel_ref, env):
+    # Kaggle's public API has no documented "cancel/delete a queued kernel" endpoint.
+    # The closest safe equivalent is pushing a trivial, instantly-finishing version
+    # to this EXACT kernel id. Kaggle only ever runs one active version per kernel,
+    # so this supersedes the stuck queued run without touching any other notebook
+    # on the account ("Your Work" and every other kernel are left untouched).
+    try:
+        owner, slug = kernel_ref.split("/", 1)
+        tmp = Path(tempfile.mkdtemp(prefix="zaiko_cleanup_"))
+        (tmp / "server.ipynb").write_text(json.dumps({
+            "cells": [{"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": ["print('cleared')\n"]}],
+            "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}, "language_info": {"name": "python"}},
+            "nbformat": 4, "nbformat_minor": 5,
+        }), encoding="utf-8")
+        (tmp / "kernel-metadata.json").write_text(json.dumps({
+            "id": kernel_ref, "title": slug, "code_file": "server.ipynb", "language": "python",
+            "kernel_type": "notebook", "is_private": True, "enable_gpu": False, "enable_internet": False,
+            "dataset_sources": [], "competition_sources": [], "kernel_sources": [], "model_sources": [],
+        }), encoding="utf-8")
+        subprocess.run(["kaggle", "kernels", "push", "-p", str(tmp)], env=env, capture_output=True, text=True, check=False, timeout=30)
+        shutil.rmtree(tmp, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def build_server_source(username):
     raw_url = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/queue/{username}.json"
     src = '''import json, time, base64, subprocess, sys, urllib.request
@@ -578,6 +623,55 @@ except Exception as exc:
     return src.replace("__RAW_URL__", raw_url)
 
 
+def _poll_for_ready(username, job_id, kernel_ref, env, report, enforce_queue_timeout):
+    """Poll an already-pushed/-running kernel for its server_status.json.
+    If enforce_queue_timeout is True, also watches Kaggle's own queued/running
+    state and triggers the scoped cleanup after QUEUE_TIMEOUT_SECONDS stuck in
+    'queued'. Returns True once connected, False on any terminal outcome."""
+    queued_since = None
+    for _ in range(240):
+        if enforce_queue_timeout:
+            k_status = kaggle_kernel_status(kernel_ref, env)
+            if k_status == "queued":
+                queued_since = queued_since or time.time()
+                if time.time() - queued_since > QUEUE_TIMEOUT_SECONDS:
+                    _cleanup_stuck_kernel(kernel_ref, env)
+                    report(
+                        status="failed",
+                        error="This server instance stayed queued on Kaggle for over 5 minutes, "
+                              "so only that stuck instance was reset (no other notebooks were touched). "
+                              "Please try Connect again.",
+                        progress=0,
+                    )
+                    return False
+            elif k_status == "running":
+                queued_since = None
+        probe_dir = Path(tempfile.mkdtemp(prefix="zaiko_probe_"))
+        try:
+            subprocess.run(["kaggle", "kernels", "output", kernel_ref, "-p", str(probe_dir), "-o", "-q"], env=env, capture_output=True, text=True, check=False, timeout=30)
+            status_files = list(probe_dir.rglob("server_status.json"))
+            if status_files:
+                payload = json.loads(status_files[0].read_text(encoding="utf-8"))
+                phase = payload.get("phase"); logs = payload.get("logs", [])
+                if phase == "ready":
+                    report(status="connected", message="Connected", progress=100, logs=logs)
+                    return True
+                if phase == "error":
+                    report(status="failed", error=payload.get("message", "Server failed to start."), logs=logs)
+                    return False
+                if phase == "stopped":
+                    report(status="disconnected", message=payload.get("message", "Disconnected"), logs=logs)
+                    return False
+                report(status="installing", message=payload.get("message", "Installing..."), progress=min(90, 15 + len(logs) * 6), logs=logs)
+        except Exception:
+            pass
+        finally:
+            shutil.rmtree(probe_dir, ignore_errors=True)
+        time.sleep(4)
+    report(status="failed", error="The server took too long to start. Please try again.")
+    return False
+
+
 def run_connect_job(username, job_id, gen_username, gen_token):
     def report(**fields):
         update_job(username, job_id, **fields)
@@ -585,47 +679,38 @@ def run_connect_job(username, job_id, gen_username, gen_token):
     try:
         ensure_queue(username)
         kernel_slug = re.sub(r"[^a-z0-9-]", "-", f"zaiko-srv-{username.lower()}").strip("-")[:80]
+        kernel_ref = f"{gen_username}/{kernel_slug}"
+        env = os.environ.copy(); env["KAGGLE_USERNAME"] = gen_username; env["KAGGLE_API_TOKEN"] = gen_token; env["KAGGLE_KEY"] = gen_token
+
+        report(status="connecting", message="Checking for an existing server...", progress=5, kernel_ref=kernel_ref, logs=[])
+
+        # Reuse an already-running instance for this user instead of pushing a
+        # brand-new one (same deterministic kernel id per user => this never
+        # creates or affects any other notebook on the account).
+        if kaggle_kernel_status(kernel_ref, env) == "running":
+            report(status="installing", message="Reusing your existing server session...", progress=40)
+            if _poll_for_ready(username, job_id, kernel_ref, env, report, enforce_queue_timeout=False):
+                return
+
         workspace = Path(tempfile.mkdtemp(prefix="zaiko_srv_"))
         notebook_path = workspace / "server.ipynb"
         metadata_path = workspace / "kernel-metadata.json"
         source = build_server_source(username)
         notebook = {"cells": [{"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": source.splitlines(True)}], "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}, "language_info": {"name": "python"}}, "nbformat": 4, "nbformat_minor": 5}
         notebook_path.write_text(json.dumps(notebook, indent=2), encoding="utf-8")
-        kernel_ref = f"{gen_username}/{kernel_slug}"
-        metadata = {"id": kernel_ref, "title": kernel_slug, "code_file": "server.ipynb", "language": "python", "kernel_type": "notebook", "is_private": True, "enable_gpu": True, "enable_internet": True, "machine_shape": "NvidiaTeslaT4", "dataset_sources": [], "competition_sources": [], "kernel_sources": [], "model_sources": []}
+        # NOTE: enable_gpu only requests *a* GPU. Kaggle's public kernel-metadata.json
+        # schema has no documented field to force a specific accelerator (e.g. "T4 x2") -
+        # Kaggle assigns whichever GPU is available on the account, so this can't be
+        # guaranteed from here.
+        metadata = {"id": kernel_ref, "title": kernel_slug, "code_file": "server.ipynb", "language": "python", "kernel_type": "notebook", "is_private": True, "enable_gpu": True, "enable_internet": True, "dataset_sources": [], "competition_sources": [], "kernel_sources": [], "model_sources": []}
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        env = os.environ.copy(); env["KAGGLE_USERNAME"] = gen_username; env["KAGGLE_API_TOKEN"] = gen_token; env["KAGGLE_KEY"] = gen_token
-        report(status="connecting", message="Connecting to server...", progress=5, kernel_ref=kernel_ref, logs=[])
+        report(status="connecting", message="Connecting to server...", progress=10)
         pushed = subprocess.run(["kaggle", "kernels", "push", "-p", str(workspace)], env=env, capture_output=True, text=True, check=False)
         if pushed.returncode != 0:
             report(status="failed", error="Could not start the server. Please check your generation credentials.")
             return
         report(status="installing", message="Server starting, installing dependencies...", progress=15)
-        for _ in range(240):
-            probe_dir = Path(tempfile.mkdtemp(prefix="zaiko_probe_"))
-            try:
-                subprocess.run(["kaggle", "kernels", "output", kernel_ref, "-p", str(probe_dir), "-o", "-q"], env=env, capture_output=True, text=True, check=False, timeout=30)
-                status_files = list(probe_dir.rglob("server_status.json"))
-                if status_files:
-                    payload = json.loads(status_files[0].read_text(encoding="utf-8"))
-                    phase = payload.get("phase")
-                    logs = payload.get("logs", [])
-                    if phase == "ready":
-                        report(status="connected", message="Connected", progress=100, logs=logs)
-                        return
-                    if phase == "error":
-                        report(status="failed", error=payload.get("message", "Server failed to start."), logs=logs)
-                        return
-                    if phase == "stopped":
-                        report(status="disconnected", message=payload.get("message", "Disconnected"), logs=logs)
-                        return
-                    report(status="installing", message=payload.get("message", "Installing..."), progress=min(90, 15 + len(logs) * 6), logs=logs)
-            except Exception:
-                pass
-            finally:
-                shutil.rmtree(probe_dir, ignore_errors=True)
-            time.sleep(4)
-        report(status="failed", error="The server took too long to start. Please try again.")
+        _poll_for_ready(username, job_id, kernel_ref, env, report, enforce_queue_timeout=True)
     except FileNotFoundError:
         update_job(username, job_id, status="failed", error="The generation service is not available right now.")
     except Exception:
@@ -716,9 +801,12 @@ footer{visibility:hidden!important;height:0!important;}
 header[data-testid="stHeader"]{background:transparent!important;height:0!important;min-height:0!important;}
 [data-testid="stSidebar"]{background:#070e1b;border-right:1px solid var(--line)}
 .brand{font-weight:900;letter-spacing:.7px;font-size:1.25rem;background:linear-gradient(90deg,#56dcff,#8b7cff,#ff76cf);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.zhead{position:fixed;top:0;left:0;right:0;z-index:9999;background:rgba(5,10,20,.91);backdrop-filter:blur(18px);border-bottom:1px solid var(--line);padding:12px 22px 12px 58px;min-height:58px;display:flex;align-items:center}
-/* Restyle Streamlit's real sidebar toggle as a clean hamburger icon, positioned inside the fixed header */
-[data-testid="stSidebarCollapsedControl"]{position:fixed!important;top:10px!important;left:14px!important;z-index:10000!important;}
+.zhead{position:fixed;top:env(safe-area-inset-top,0px);left:0;right:0;z-index:9999;background:rgba(5,10,20,.91);backdrop-filter:blur(18px);border-bottom:1px solid var(--line);padding:14px 22px 14px 60px;min-height:58px;display:flex;align-items:center}
+/* Restyle Streamlit's real sidebar toggle as a clean hamburger icon, aligned with the fixed header.
+   (Note: on Streamlit Community Cloud, the app's OWNER also sees a separate platform toolbar —
+   Share/star/manage-app — above and below the app itself; that is hosting chrome outside our
+   app's DOM and can't be restyled or hidden from app.py. Regular visitors don't see it.) */
+[data-testid="stSidebarCollapsedControl"]{position:fixed!important;top:calc(env(safe-area-inset-top,0px) + 12px)!important;left:16px!important;z-index:10000!important;}
 [data-testid="stSidebarCollapsedControl"] svg{display:none!important;}
 [data-testid="stSidebarCollapsedControl"]::after{content:"☰";font-size:1.5rem;color:#bfeeff;}
 [data-testid="stSidebar"] [data-testid="baseButton-headerNoPadding"] svg{display:none!important;}
@@ -759,11 +847,17 @@ if share_token:
 user_db = fetch_live_database()
 
 # -------------------- AUTH RESTORE --------------------
+# Cookies written from inside components.html can be silently blocked by mobile
+# Chrome / Streamlit Cloud's sandboxed iframe (third-party cookie policies), so
+# the URL's own ?sid= query param is the reliable persistence path; the cookie
+# is kept only as a bonus for browsers that do allow it.
 if not st.session_state.auth_session:
-    sid = cookie_session_id()
+    sid = cookie_session_id() or st.query_params.get("sid")
     username = resolve_session(sid) if sid else None
     if username and username in user_db and not user_db[username].get("is_revoked", False):
-        st.session_state.auth_session = True; st.session_state.current_user = username; st.session_state.session_id = sid; touch_session(sid)
+        st.session_state.auth_session = True; st.session_state.current_user = username; st.session_state.session_id = sid
+        st.query_params["sid"] = sid
+        touch_session(sid)
 
 
 def login_page():
@@ -800,12 +894,11 @@ def login_page():
                 st.session_state.current_user = username
                 st.session_state.session_id = sid
                 st.session_state.page = "Dashboard"
+                # sid in the URL is what actually survives a hard refresh (cookies
+                # from components.html get blocked by some mobile browsers); the
+                # cookie is set too as a harmless bonus for browsers that allow it.
                 st.query_params["page"] = "Dashboard"
-                # Set the cookie quietly in the background (no forced reload — a JS
-                # reload can race with st.rerun() and lose the session in some
-                # browsers/hosts). Immediate navigation relies on session_state via
-                # st.rerun(), which is reliable; the cookie only matters for
-                # restoring the session after a later hard refresh.
+                st.query_params["sid"] = sid
                 set_cookie(sid, reload=False)
                 st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
