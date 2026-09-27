@@ -310,12 +310,16 @@ def sessions_for_user(username):
     return [{"sid": sid, **data} for sid, data in load_sessions().items() if data.get("username") == username]
 
 
-def set_cookie(sid, max_age_days=30):
+def set_cookie(sid, max_age_days=30, reload=False):
     max_age = max_age_days * 86400
+    reload_js = "setTimeout(function(){window.parent.location.reload();},150);" if reload else ""
     components.html(
         f'''<script>
+        try {{
+            window.parent.document.cookie = "zaiko_session={sid}; path=/; max-age={max_age}; samesite=Lax";
+        }} catch (e) {{}}
         document.cookie = "zaiko_session={sid}; path=/; max-age={max_age}; samesite=Lax";
-        setTimeout(function(){{window.parent.location.reload();}},150);
+        {reload_js}
         </script>''',
         height=0,
     )
@@ -796,11 +800,14 @@ def login_page():
                 st.session_state.current_user = username
                 st.session_state.session_id = sid
                 st.session_state.page = "Dashboard"
-                # set_cookie triggers its own browser reload once the cookie is written,
-                # so we deliberately avoid an extra st.rerun() here (that mismatch was
-                # the cause of needing 2-3 clicks to actually land on the dashboard).
-                set_cookie(sid)
-                st.stop()
+                st.query_params["page"] = "Dashboard"
+                # Set the cookie quietly in the background (no forced reload — a JS
+                # reload can race with st.rerun() and lose the session in some
+                # browsers/hosts). Immediate navigation relies on session_state via
+                # st.rerun(), which is reliable; the cookie only matters for
+                # restoring the session after a later hard refresh.
+                set_cookie(sid, reload=False)
+                st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
     msg = quote(f"Hi {ADMIN_CONTACT_NAME}, I want to request access to {BRAND}.")
     st.markdown(f'''<div class="card" style="text-align:center"><div style="font-weight:800">Need access?</div><div class="small">{ADMIN_CONTACT_NAME}</div><a class="wa" href="https://wa.me/{WHATSAPP_NUMBER_INTL}?text={msg}" target="_blank">💬 Contact on WhatsApp</a></div></div>''', unsafe_allow_html=True)
