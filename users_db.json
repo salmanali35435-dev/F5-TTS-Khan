@@ -22,7 +22,7 @@
     },
     "RAZA": {
       "password": "Raza123",
-      "expiry_timestamp": "2026-09-29 12:40:21",
+      "expiry_timestamp": "2026-09-30 12:40:21",
       "total_limit": 1000,
       "remaining_chars": 96150,
       "is_revoked": false,
